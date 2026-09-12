@@ -1,0 +1,211 @@
+#Requires -Modules Az.Accounts, Az.Network, Az.Compute, Az.Security
+
+<#
+.SYNOPSIS
+    DORA technical-evidence collector — Network Segmentation & Exposure (Article 9).
+
+.DESCRIPTION
+    This is a SMALL, DELIBERATELY LIMITED evidence-gathering script for the DORA
+    Self-Assessment Tool. It does NOT answer Yes/Partly/No for you.
+
+    It connects to Azure Resource Manager (read-only) and checks network-layer
+    protection controls, tagged to Article 9 (Protection and prevention — network
+    security, segmentation, and minimising the attack surface).
+
+    The theme repeats from the other scripts: a Network Security Group existing is
+    not the same as it doing anything. This script specifically hunts for the two
+    most common real-world network exposure mistakes — management ports (RDP/SSH)
+    open directly to the internet, and VMs with a public IP attached with no
+    Bastion/jump-host in front of them — rather than just confirming NSGs exist.
+
+    A human still has to judge whether any flagged exposure is a deliberate,
+    documented exception (e.g. a public-facing web tier that's SUPPOSED to accept
+    internet traffic on 443) versus an oversight — this script only reports
+    configuration state, not intent.
+
+    Permissions required (read-only):
+        Reader on the subscription(s) you want to check
+
+.NOTES
+    Run this against ONE subscription at a time (pass -SubscriptionId, or loop over
+    Get-AzSubscription yourself for multiple).
+
+    This checks Azure-native networking (NSGs, public IPs, Bastion, DDoS plans). It
+    does NOT check third-party firewalls/NVAs, on-premises network segmentation, or
+    application-layer access controls (e.g. a WAF rule set) — those need separate,
+    product-specific checks.
+
+.OUTPUTS
+    A CSV report at .\DORA-Evidence-NetworkSegmentation.csv and a console summary.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = ".\DORA-Evidence-NetworkSegmentation.csv",
+    [string]$SubscriptionId,
+    [int[]]$SensitivePorts = @(22, 3389, 445, 1433, 3306, 5432)
+)
+
+# ---------------------------------------------------------------------------
+# 1. Connect (read-only)
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+if ($SubscriptionId) {
+    Connect-AzAccount -Subscription $SubscriptionId | Out-Null
+} else {
+    Connect-AzAccount | Out-Null
+}
+
+$context = Get-AzContext
+Write-Host "Connected to subscription: $($context.Subscription.Name) ($($context.Subscription.Id))" -ForegroundColor Green
+Write-Host ""
+
+$findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Finding {
+    param($Control, $Status, $Evidence, $SuggestedNote, $Section = "1")
+    $findings.Add([PSCustomObject]@{
+        Article       = 9
+        Section       = $Section
+        Topic         = "ICT Risk management"
+        Control       = $Control
+        Status        = $Status
+        Evidence      = $Evidence
+        SuggestedNote = $SuggestedNote
+    })
+}
+
+# ---------------------------------------------------------------------------
+# 2. THE KEY CHECK: NSG rules allowing sensitive ports in from Internet/Any
+# ---------------------------------------------------------------------------
+Write-Host "Scanning Network Security Group rules for internet-exposed management ports..." -ForegroundColor Cyan
+$nsgs = Get-AzNetworkSecurityGroup -ErrorAction SilentlyContinue
+
+$riskyRules = @()
+if ($nsgs) {
+    foreach ($nsg in $nsgs) {
+        $inboundRules = $nsg.SecurityRules | Where-Object { $_.Direction -eq "Inbound" -and $_.Access -eq "Allow" }
+        foreach ($rule in $inboundRules) {
+            $sourceIsOpen = $rule.SourceAddressPrefix -in @("*", "Internet", "0.0.0.0/0", "Any")
+            if (-not $sourceIsOpen) { continue }
+
+            $portRanges = $rule.DestinationPortRange
+            foreach ($sensitivePort in $SensitivePorts) {
+                $matchesPort = $portRanges | Where-Object {
+                    $_ -eq "*" -or $_ -eq "$sensitivePort" -or
+                    ($_ -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -le $sensitivePort -and [int]$Matches[2] -ge $sensitivePort)
+                }
+                if ($matchesPort) {
+                    $riskyRules += "$($nsg.Name)/$($rule.Name): port $sensitivePort open from '$($rule.SourceAddressPrefix)'"
+                    break
+                }
+            }
+        }
+    }
+}
+
+Add-Finding -Control "NSG rules exposing sensitive ports (SSH/RDP/DB) to Internet or Any source" `
+    -Status $(if ($riskyRules) { "Attention needed — $($riskyRules.Count) rule(s)" } else { "None found (good)" }) `
+    -Evidence $(if ($riskyRules) { $riskyRules -join "; " } else { "No inbound NSG rule allows a sensitive port ($($SensitivePorts -join ', ')) from an unrestricted source." }) `
+    -SuggestedNote $(if ($riskyRules) {
+        "This is the single most common real-world network exposure mistake — a management port (SSH/RDP) or database port open directly to the internet. Confirm whether Just-In-Time VM access or a Bastion host is used instead, or whether this is a deliberate, documented exception."
+    } else { "N/A" })
+
+# ---------------------------------------------------------------------------
+# 3. VMs with a public IP directly attached (bypasses any perimeter control)
+# ---------------------------------------------------------------------------
+Write-Host "Checking for VMs with public IP addresses directly attached..." -ForegroundColor Cyan
+$nics = Get-AzNetworkInterface -ErrorAction SilentlyContinue
+$vmsWithPublicIp = @()
+
+foreach ($nic in $nics) {
+    if (-not $nic.VirtualMachine) { continue }
+    foreach ($ipConfig in $nic.IpConfigurations) {
+        if ($ipConfig.PublicIpAddress) {
+            $vmName = $nic.VirtualMachine.Id -split '/' | Select-Object -Last 1
+            $vmsWithPublicIp += $vmName
+        }
+    }
+}
+
+Add-Finding -Control "VMs with a public IP address directly attached" `
+    -Status $(if ($vmsWithPublicIp) { "Attention needed — $($vmsWithPublicIp.Count) VM(s)" } else { "None found (good)" }) `
+    -Evidence $(if ($vmsWithPublicIp) { ($vmsWithPublicIp | Select-Object -Unique) -join "; " } else { "No VM network interfaces have a public IP address directly attached." }) `
+    -SuggestedNote $(if ($vmsWithPublicIp) {
+        "A direct public IP bypasses any perimeter control (firewall, WAF, Bastion) sitting elsewhere in the architecture. Confirm whether each of these is intentionally internet-facing (e.g. a public web server on 443) or should instead sit behind a load balancer/gateway with the VM itself on a private IP."
+    } else { "N/A" })
+
+# ---------------------------------------------------------------------------
+# 4. Azure Bastion — secure remote access alternative to direct RDP/SSH
+# ---------------------------------------------------------------------------
+Write-Host "Checking for Azure Bastion deployment..." -ForegroundColor Cyan
+$bastions = Get-AzBastion -ErrorAction SilentlyContinue
+
+Add-Finding -Control "Azure Bastion deployed (secure remote access)" `
+    -Status $(if ($bastions) { "Evidence found — $($bastions.Count) deployment(s)" } else { "Not found" }) `
+    -Evidence $(if ($bastions) { ($bastions | ForEach-Object { "$($_.Name) (VNet: $($_.VirtualNetwork.Id -split '/' | Select-Object -Last 1))" }) -join "; " } else { "No Azure Bastion resources found in this subscription." }) `
+    -SuggestedNote $(if ($bastions) {
+        "Bastion existing doesn't confirm it's the ONLY way in — check the NSG finding above for VMs that still also allow direct RDP/SSH despite Bastion being available."
+    } else {
+        "Without Bastion (or an equivalent jump-host/VPN pattern), remote administrative access likely relies on direct RDP/SSH exposure — cross-reference against the sensitive-ports finding above."
+    })
+
+# ---------------------------------------------------------------------------
+# 5. DDoS Protection Plan — network-layer resilience against volumetric attacks
+# ---------------------------------------------------------------------------
+Write-Host "Checking DDoS protection on virtual networks..." -ForegroundColor Cyan
+$vnets = Get-AzVirtualNetwork -ErrorAction SilentlyContinue
+
+if (-not $vnets) {
+    Add-Finding -Control "DDoS protection on virtual networks" `
+        -Status "No matching resource found" `
+        -Evidence "No virtual networks found in this subscription." `
+        -SuggestedNote "N/A"
+} else {
+    $unprotectedVnets = $vnets | Where-Object { -not $_.DdosProtectionPlan -or $_.EnableDdosProtection -ne $true }
+
+    Add-Finding -Control "Virtual networks WITHOUT a DDoS Protection Plan enabled" `
+        -Status $(if ($unprotectedVnets) { "$($unprotectedVnets.Count) / $($vnets.Count) VNet(s) unprotected" } else { "All VNets protected" }) `
+        -Evidence $(if ($unprotectedVnets) { ($unprotectedVnets | ForEach-Object { $_.Name }) -join "; " } else { "All VNets have DDoS Protection Standard enabled." }) `
+        -SuggestedNote "Azure's Basic DDoS protection is free and always on for all VNets, but the Standard tier (paid, adds adaptive tuning and attack analytics) is what this check looks for. Whether Standard is warranted depends on whether any resource in the VNet is directly internet-facing and business-critical."
+}
+
+# ---------------------------------------------------------------------------
+# 6. Just-In-Time VM access (Defender for Cloud) — reduces exposure window
+# ---------------------------------------------------------------------------
+Write-Host "Checking for Just-In-Time VM access configuration..." -ForegroundColor Cyan
+try {
+    $jitPolicies = Get-AzJitNetworkAccessPolicy -ErrorAction Stop
+    Add-Finding -Control "Just-In-Time VM access configured (Defender for Cloud)" `
+        -Status $(if ($jitPolicies) { "Evidence found — $($jitPolicies.Count) polic(y/ies)" } else { "Not configured" }) `
+        -Evidence $(if ($jitPolicies) { ($jitPolicies | ForEach-Object { $_.Name }) -join "; " } else { "No JIT VM access policies found." }) `
+        -SuggestedNote $(if ($jitPolicies) {
+            "JIT reduces the exposure window for management ports by only opening them on approved, time-bound request — but a JIT policy existing doesn't confirm the underlying NSG rule isn't ALSO left permanently open elsewhere. Cross-reference against the sensitive-ports finding above."
+        } else {
+            "Without JIT, any open management port (see finding above) stays open permanently rather than only during an approved access window. This requires Microsoft Defender for Servers to be enabled — if that plan isn't on, this will always show 'Not configured' regardless of actual risk appetite."
+        })
+} catch {
+    Add-Finding -Control "Just-In-Time VM access configured (Defender for Cloud)" `
+        -Status "Could not retrieve" `
+        -Evidence "Get-AzJitNetworkAccessPolicy failed: $($_.Exception.Message). This commonly means Microsoft Defender for Servers is not enabled on this subscription." `
+        -SuggestedNote "Check the Defender for Cloud plan tier directly if this is unexpected."
+}
+
+# ---------------------------------------------------------------------------
+# 7. Output
+# ---------------------------------------------------------------------------
+$findings | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== DORA Evidence Report (Article 9 — Network Segmentation & Exposure) ===" -ForegroundColor Yellow
+$findings | Format-Table Control, Status -AutoSize -Wrap
+Write-Host ""
+Write-Host "Full report with evidence and notes written to: $OutputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "REMINDER: This report is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "The internet-exposed sensitive-port finding is the one most likely to reveal" -ForegroundColor Red
+Write-Host "a genuine gap. A human still needs to confirm which exposures are deliberate," -ForegroundColor Red
+Write-Host "documented exceptions versus oversights, and whether compensating controls" -ForegroundColor Red
+Write-Host "(Bastion, JIT, WAF) are actually in front of what looks exposed." -ForegroundColor Red
+
+Disconnect-AzAccount | Out-Null
