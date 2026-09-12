@@ -1,0 +1,226 @@
+#Requires -Modules Microsoft.Graph.Identity.Governance, Microsoft.Graph.Identity.DirectoryManagement, Microsoft.Graph.Users
+
+<#
+.SYNOPSIS
+    DORA technical-evidence collector — Privileged Access / PIM (Article 9).
+
+.DESCRIPTION
+    This is a SMALL, DELIBERATELY LIMITED evidence-gathering script for the DORA
+    Self-Assessment Tool. It does NOT answer Yes/Partly/No for you.
+
+    It connects to Microsoft Graph (read-only) and inspects how privileged directory
+    roles (Global Administrator, Privileged Role Administrator, Security Administrator)
+    are assigned and governed, tagged to Article 9 (Protection and prevention — least
+    privilege, segregation of duties, strong authentication for privileged access).
+
+    The single most important thing this script checks is the same theme as the
+    backup script: not "does a control exist somewhere" but "is it actually being
+    used, for the roles that matter". A tenant can have PIM licensed and configured
+    for some roles while its Global Administrators still hold PERMANENT, always-on
+    access with no time-bound activation, no MFA-on-activation requirement, and no
+    approval step — which defeats most of the point of least-privilege access.
+
+    A human still has to decide whether your specific role list, activation duration,
+    and approval requirements meet your organization's own risk appetite — this
+    script only reports configuration state, not adequacy.
+
+    NOTE ON COMPLEXITY: Microsoft Graph's PIM policy schema (role management policies
+    and their rules) is deeply nested and has changed shape across API versions. The
+    policy-rule parsing in Part 3 below is the most likely part of this script to need
+    adjustment for your tenant's exact Graph SDK version — treat it as a starting
+    point, and verify a sample finding manually in the Entra admin center before
+    trusting it at scale.
+
+    Permissions required (read-only, delegated):
+        RoleManagement.Read.Directory
+        RoleManagement.Read.All
+        Directory.Read.All
+        AccessReview.Read.All
+
+.NOTES
+    Run this on a machine with internet access to Microsoft Graph. Authenticates
+    interactively by default — you'll get a browser sign-in prompt. No credentials
+    are stored by this script. PIM data requires an Entra ID P2 (or Governance) license
+    in the tenant; without it, eligible-assignment and policy queries will return
+    empty rather than erroring, which this script treats as "no PIM in use" — confirm
+    your license tier before concluding that from an empty result.
+
+.OUTPUTS
+    A CSV report at .\DORA-Evidence-PrivilegedAccess.csv and a console summary.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = ".\DORA-Evidence-PrivilegedAccess.csv",
+    [string[]]$HighPrivilegeRoles = @(
+        "Global Administrator",
+        "Privileged Role Administrator",
+        "Security Administrator",
+        "Exchange Administrator",
+        "SharePoint Administrator"
+    )
+)
+
+# ---------------------------------------------------------------------------
+# 1. Connect (read-only scopes — this script never writes anything to your tenant)
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to Microsoft Graph (read-only)..." -ForegroundColor Cyan
+Connect-MgGraph -Scopes "RoleManagement.Read.Directory", "RoleManagement.Read.All", "Directory.Read.All", "AccessReview.Read.All" -NoWelcome
+
+$tenantInfo = Get-MgOrganization | Select-Object -First 1
+Write-Host "Connected to tenant: $($tenantInfo.DisplayName)" -ForegroundColor Green
+Write-Host ""
+
+$findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Finding {
+    param($Control, $Status, $Evidence, $SuggestedNote, $Section = "1")
+    $findings.Add([PSCustomObject]@{
+        Article       = 9
+        Section       = $Section
+        Topic         = "ICT Risk management"
+        Control       = $Control
+        Status        = $Status
+        Evidence      = $Evidence
+        SuggestedNote = $SuggestedNote
+    })
+}
+
+# ---------------------------------------------------------------------------
+# 2. Resolve the high-privilege role definitions we care about
+# ---------------------------------------------------------------------------
+Write-Host "Resolving role definitions..." -ForegroundColor Cyan
+$allRoleDefs = Get-MgRoleManagementDirectoryRoleDefinition -All
+$targetRoles = $allRoleDefs | Where-Object { $_.DisplayName -in $HighPrivilegeRoles }
+
+if (-not $targetRoles) {
+    Write-Warning "None of the target role names matched this tenant's role definitions. Role display names can vary slightly — check Get-MgRoleManagementDirectoryRoleDefinition -All | Select DisplayName for exact names."
+}
+
+foreach ($role in $targetRoles) {
+    Write-Host "  Checking role: $($role.DisplayName)" -ForegroundColor Yellow
+
+    # -----------------------------------------------------------------------
+    # 3a. STANDING (permanent, non-PIM) assignments — the key risk signal
+    # -----------------------------------------------------------------------
+    $activeAssignments = Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -Filter "roleDefinitionId eq '$($role.Id)'" -ErrorAction SilentlyContinue
+
+    $permanentAssignments = $activeAssignments | Where-Object { $_.AssignmentType -eq "Assigned" -and -not $_.EndDateTime }
+    $permanentCount = ($permanentAssignments | Measure-Object).Count
+
+    $permanentNames = @()
+    foreach ($a in $permanentAssignments) {
+        $user = Get-MgUser -UserId $a.PrincipalId -ErrorAction SilentlyContinue
+        if ($user) { $permanentNames += $user.DisplayName } else { $permanentNames += $a.PrincipalId }
+    }
+
+    Add-Finding -Control "Standing (permanent, non-time-bound) assignment: $($role.DisplayName)" `
+        -Status $(if ($permanentCount -gt 0) { "Attention needed — $permanentCount permanent assignment(s)" } else { "None found (good)" }) `
+        -Evidence $(if ($permanentNames) { $permanentNames -join "; " } else { "No permanent standing assignments found for this role." }) `
+        -SuggestedNote $(if ($permanentCount -gt 0) {
+            "Permanent access to a high-privilege role bypasses just-in-time activation entirely. Confirm whether these are legitimate exceptions (e.g. a documented break-glass account, which SHOULD be excluded from Conditional Access and separately monitored) or accounts that should be moved to PIM-eligible instead."
+        } else {
+            "No standing assignments does not by itself confirm PIM is used correctly — check the eligible-assignment and policy findings below too."
+        })
+
+    # -----------------------------------------------------------------------
+    # 3b. PIM-eligible assignments — evidence that JIT is actually configured
+    # -----------------------------------------------------------------------
+    $eligibleAssignments = Get-MgRoleManagementDirectoryRoleEligibilityScheduleInstance -Filter "roleDefinitionId eq '$($role.Id)'" -ErrorAction SilentlyContinue
+    $eligibleCount = ($eligibleAssignments | Measure-Object).Count
+
+    Add-Finding -Control "PIM-eligible (just-in-time) assignment configured: $($role.DisplayName)" `
+        -Status $(if ($eligibleCount -gt 0) { "Evidence found — $eligibleCount eligible assignment(s)" } else { "No eligible assignments found" }) `
+        -Evidence $(if ($eligibleCount -gt 0) { "$eligibleCount user(s)/group(s) hold this role as PIM-eligible rather than permanently active." } else { "No PIM eligibility records found for this role. This may mean PIM is not licensed/configured, or that this specific role isn't using it." }) `
+        -SuggestedNote "If this is 0 while the standing-assignment count above is greater than 0, that combination is the strongest single indicator that just-in-time access is not in use for this role."
+
+    # -----------------------------------------------------------------------
+    # 3c. PIM activation policy — MFA requirement, approval, max duration
+    #     (This is the most schema-fragile part — see script header note.)
+    # -----------------------------------------------------------------------
+    $policyAssignment = Get-MgPolicyRoleManagementPolicyAssignment -Filter "scopeId eq '/' and scopeType eq 'DirectoryRole' and roleDefinitionId eq '$($role.Id)'" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if ($policyAssignment) {
+        $policyRules = Get-MgPolicyRoleManagementPolicyRule -UnifiedRoleManagementPolicyId $policyAssignment.PolicyId -ErrorAction SilentlyContinue
+
+        $enablementRule = $policyRules | Where-Object { $_.Id -eq "Enablement_EndUser_Assignment" }
+        $mfaRequired = $enablementRule -and ($enablementRule.AdditionalProperties.enabledRules -contains "MultiFactorAuthentication")
+
+        $approvalRule = $policyRules | Where-Object { $_.Id -eq "Approval_EndUser_Assignment" }
+        $approvalRequired = $approvalRule -and $approvalRule.AdditionalProperties.setting.isApprovalRequired -eq $true
+
+        $expirationRule = $policyRules | Where-Object { $_.Id -eq "Expiration_EndUser_Assignment" }
+        $maxDuration = if ($expirationRule) { $expirationRule.AdditionalProperties.maximumDuration } else { "Unknown" }
+
+        Add-Finding -Control "MFA required at role activation: $($role.DisplayName)" `
+            -Status $(if ($mfaRequired) { "Evidence found" } else { "Not confirmed / not required" }) `
+            -Evidence "PIM activation policy for this role $(if ($mfaRequired) {'requires'} else {'does not clearly require'}) MFA at the moment of activation (separate from any Conditional Access MFA policy)." `
+            -SuggestedNote "This is specifically MFA at PIM activation time, which is a distinct control from a general Conditional Access MFA policy — a user could already be MFA'd for the day and still be required to re-authenticate to activate a privileged role."
+
+        Add-Finding -Control "Approval required at role activation: $($role.DisplayName)" `
+            -Status $(if ($approvalRequired) { "Evidence found" } else { "Not required" }) `
+            -Evidence "PIM activation policy for this role $(if ($approvalRequired) {'requires'} else {'does not require'}) a separate approver to sign off on activation." `
+            -SuggestedNote "Approval requirements are most relevant for your highest-blast-radius roles (Global Administrator, Privileged Role Administrator) rather than every role uniformly."
+
+        Add-Finding -Control "Maximum activation duration: $($role.DisplayName)" `
+            -Status "Evidence found" `
+            -Evidence "Maximum PIM activation duration configured: $maxDuration" `
+            -SuggestedNote "Compare against your organization's own policy for how long a just-in-time activation should last — shorter windows (e.g. 1-4 hours) reduce the exposure window more than 8-24 hour windows."
+    } else {
+        Add-Finding -Control "PIM activation policy retrieval: $($role.DisplayName)" `
+            -Status "No policy found / not retrievable" `
+            -Evidence "Could not retrieve a role management policy assignment for this role. This can mean PIM is not licensed for this tenant, the role uses a default unassigned policy, or the Graph query above needs adjusting for your tenant's configuration." `
+            -SuggestedNote "Verify directly in the Entra admin center under Privileged Identity Management > Azure AD roles > Settings for this role."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4. Global Administrator headcount (Microsoft's own guidance: keep this small)
+# ---------------------------------------------------------------------------
+Write-Host "Checking Global Administrator headcount..." -ForegroundColor Cyan
+$gaRole = $allRoleDefs | Where-Object { $_.DisplayName -eq "Global Administrator" } | Select-Object -First 1
+if ($gaRole) {
+    $gaActive = Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -Filter "roleDefinitionId eq '$($gaRole.Id)'" -ErrorAction SilentlyContinue
+    $gaCount = ($gaActive | Measure-Object).Count
+
+    Add-Finding -Control "Total active Global Administrator count (permanent + currently-activated)" `
+        -Status $(if ($gaCount -gt 4) { "Attention needed — $gaCount active" } else { "Within typical guidance — $gaCount active" }) `
+        -Evidence "$gaCount principal(s) currently hold an active Global Administrator assignment (via standing assignment or an active PIM activation at query time)." `
+        -SuggestedNote "Microsoft's own guidance is to keep Global Administrator holders to a small number (commonly cited as 2-4, plus documented break-glass accounts). This count is a point-in-time snapshot — PIM-activated counts will fluctuate."
+}
+
+# ---------------------------------------------------------------------------
+# 5. Access reviews configured for privileged roles
+# ---------------------------------------------------------------------------
+Write-Host "Checking for recurring access reviews on privileged roles..." -ForegroundColor Cyan
+$accessReviews = Get-MgIdentityGovernanceAccessReviewDefinition -All -ErrorAction SilentlyContinue
+$privilegedReviews = $accessReviews | Where-Object {
+    $_.Scope.AdditionalProperties.query -match "roleDefinitions|roleEligibilitySchedule|roleAssignmentSchedule"
+}
+
+Add-Finding -Control "Recurring access review covering privileged role assignments" `
+    -Status $(if ($privilegedReviews) { "Evidence found" } else { "No matching access review found" }) `
+    -Evidence $(if ($privilegedReviews) { ($privilegedReviews | ForEach-Object { $_.DisplayName }) -join "; " } else { "No access review definition appears to target directory role assignments specifically." }) `
+    -SuggestedNote $(if ($privilegedReviews) {
+        "Confirm the review's recurrence interval and that it actually results in access being revoked when not re-certified, not just a notification that's ignored."
+    } else {
+        "Without a recurring review, privileged access tends to accumulate over time (role creep) even if PIM/JIT is correctly configured for new activations."
+    })
+
+# ---------------------------------------------------------------------------
+# 6. Output
+# ---------------------------------------------------------------------------
+$findings | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== DORA Evidence Report (Article 9 — Privileged Access / PIM) ===" -ForegroundColor Yellow
+$findings | Format-Table Control, Status -AutoSize -Wrap
+Write-Host ""
+Write-Host "Full report with evidence and notes written to: $OutputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "REMINDER: This report is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "The PIM policy-rule checks (MFA/approval/duration) are the most schema-" -ForegroundColor Red
+Write-Host "sensitive part of this script — spot-check one role's findings against the" -ForegroundColor Red
+Write-Host "Entra admin center directly before trusting this report at scale." -ForegroundColor Red
+
+Disconnect-MgGraph | Out-Null
