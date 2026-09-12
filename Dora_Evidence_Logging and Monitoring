@@ -1,0 +1,212 @@
+#Requires -Modules Az.Accounts, Az.OperationalInsights, Az.Monitor, Az.Security, Az.Resources
+
+<#
+.SYNOPSIS
+    DORA technical-evidence collector — Logging & Monitoring / Detection (Article 10).
+
+.DESCRIPTION
+    This is a SMALL, DELIBERATELY LIMITED evidence-gathering script for the DORA
+    Self-Assessment Tool. It does NOT answer Yes/Partly/No for you.
+
+    It connects to Azure Resource Manager (read-only) and checks the full detection
+    PIPELINE, not just whether logging "exists" somewhere — tagged to Article 10
+    (mechanisms to promptly detect anomalous activities and performance issues).
+
+    The theme carries over from the backup and PIM scripts: a tenant can have a Log
+    Analytics workspace, Microsoft Sentinel, and dozens of alert rules configured,
+    and STILL have no effective detection if none of the alert rules are wired to an
+    action group that actually notifies a human. Logging without alerting is not
+    detection — it's an audit trail nobody is watching until after the fact.
+
+    A human still has to judge whether the alert thresholds are meaningful, whether
+    the right resources are in scope, and whether the notified team actually acts on
+    alerts — this script only reports pipeline configuration, not effectiveness.
+
+    Permissions required (read-only):
+        Reader on the subscription(s) you want to check
+
+.NOTES
+    Run this against ONE subscription at a time (pass -SubscriptionId, or loop over
+    Get-AzSubscription yourself for multiple).
+
+    The diagnostic-settings coverage check in Part 3 samples a small set of
+    high-value resource types (VMs, Key Vaults, SQL servers, Storage accounts) rather
+    than every resource in the subscription — checking every single resource
+    individually does not scale well and can be slow/throttled in large environments.
+    Treat that finding as a representative sample, not an exhaustive inventory.
+
+.OUTPUTS
+    A CSV report at .\DORA-Evidence-LoggingMonitoring.csv and a console summary.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = ".\DORA-Evidence-LoggingMonitoring.csv",
+    [string]$SubscriptionId
+)
+
+# ---------------------------------------------------------------------------
+# 1. Connect (read-only)
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+if ($SubscriptionId) {
+    Connect-AzAccount -Subscription $SubscriptionId | Out-Null
+} else {
+    Connect-AzAccount | Out-Null
+}
+
+$context = Get-AzContext
+Write-Host "Connected to subscription: $($context.Subscription.Name) ($($context.Subscription.Id))" -ForegroundColor Green
+Write-Host ""
+
+$findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Finding {
+    param($Control, $Status, $Evidence, $SuggestedNote, $Section = "1")
+    $findings.Add([PSCustomObject]@{
+        Article       = 10
+        Section       = $Section
+        Topic         = "ICT Risk management"
+        Control       = $Control
+        Status        = $Status
+        Evidence      = $Evidence
+        SuggestedNote = $SuggestedNote
+    })
+}
+
+# ---------------------------------------------------------------------------
+# 2. Log Analytics workspaces — the foundation of the whole pipeline
+# ---------------------------------------------------------------------------
+Write-Host "Retrieving Log Analytics workspaces..." -ForegroundColor Cyan
+$workspaces = Get-AzOperationalInsightsWorkspace
+
+if (-not $workspaces) {
+    Add-Finding -Control "Log Analytics workspace present" `
+        -Status "No matching resource found" `
+        -Evidence "No Log Analytics workspaces found in this subscription." `
+        -SuggestedNote "If logs are centralised elsewhere (another subscription, a third-party SIEM, on-premises), this script will not see them. Confirm where detection logging actually lives before concluding this is a gap."
+} else {
+    foreach ($ws in $workspaces) {
+        Add-Finding -Control "Log Analytics workspace: $($ws.Name)" `
+            -Status "Evidence found" `
+            -Evidence "Retention: $($ws.retentionInDays) days. SKU: $($ws.sku)." `
+            -SuggestedNote "Confirm the retention period is adequate for your incident investigation and reporting timelines (DORA's incident reports may require reconstructing events well after the fact)."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Microsoft Sentinel (SIEM) onboarding — correlation across sources
+# ---------------------------------------------------------------------------
+Write-Host "Checking for Microsoft Sentinel onboarding..." -ForegroundColor Cyan
+$sentinelOnboarding = Get-AzResource -ResourceType "Microsoft.SecurityInsights/onboardingStates" -ErrorAction SilentlyContinue
+
+Add-Finding -Control "Microsoft Sentinel (SIEM) onboarded to a workspace" `
+    -Status $(if ($sentinelOnboarding) { "Evidence found" } else { "Not found" }) `
+    -Evidence $(if ($sentinelOnboarding) { "Sentinel onboarding found on: $(($sentinelOnboarding | ForEach-Object { $_.ResourceId -replace '/providers/Microsoft.SecurityInsights.*','' }) -join '; ')" } else { "No Sentinel onboarding state found in this subscription." }) `
+    -SuggestedNote $(if ($sentinelOnboarding) {
+        "A SIEM being onboarded does not by itself confirm it's actively correlating the sources that matter — check that your critical resources' logs actually flow into this workspace (see diagnostic settings finding below)."
+    } else {
+        "Detection can still exist without a SIEM (native Azure Monitor alerts, Defender for Cloud), but cross-source correlation and threat hunting are much weaker without one. Confirm whether detection relies on individual point tools instead."
+    })
+
+# ---------------------------------------------------------------------------
+# 4. Diagnostic settings coverage — are resources actually SENDING logs?
+#    (Sampled across high-value resource types, not exhaustive — see .NOTES)
+# ---------------------------------------------------------------------------
+Write-Host "Sampling diagnostic settings coverage on high-value resource types..." -ForegroundColor Cyan
+
+$sampleTypes = @(
+    @{ Type = "Microsoft.Compute/virtualMachines"; Label = "Virtual Machines" },
+    @{ Type = "Microsoft.KeyVault/vaults"; Label = "Key Vaults" },
+    @{ Type = "Microsoft.Sql/servers/databases"; Label = "SQL Databases" },
+    @{ Type = "Microsoft.Storage/storageAccounts"; Label = "Storage Accounts" }
+)
+
+foreach ($rt in $sampleTypes) {
+    $resources = Get-AzResource -ResourceType $rt.Type -ErrorAction SilentlyContinue
+    if (-not $resources) {
+        Add-Finding -Control "Diagnostic settings coverage: $($rt.Label)" `
+            -Status "No matching resource found" `
+            -Evidence "No resources of type $($rt.Type) found in this subscription." `
+            -SuggestedNote "N/A"
+        continue
+    }
+
+    $covered = 0
+    $uncoveredNames = @()
+    foreach ($res in $resources) {
+        $diag = Get-AzDiagnosticSetting -ResourceId $res.ResourceId -ErrorAction SilentlyContinue
+        if ($diag) { $covered++ } else { $uncoveredNames += $res.Name }
+    }
+
+    Add-Finding -Control "Diagnostic settings coverage: $($rt.Label)" `
+        -Status "$covered / $($resources.Count) resource(s) have diagnostic settings configured" `
+        -Evidence $(if ($uncoveredNames) { "Not sending diagnostic logs: $($uncoveredNames -join '; ')" } else { "All resources of this type have at least one diagnostic setting configured." }) `
+        -SuggestedNote "A resource with no diagnostic setting is invisible to your detection pipeline entirely — it will not appear in Sentinel, Log Analytics queries, or alert rules regardless of how well those are configured elsewhere."
+}
+
+# ---------------------------------------------------------------------------
+# 5. Alert rules — and whether they actually notify anyone
+# ---------------------------------------------------------------------------
+Write-Host "Retrieving alert rules and action groups..." -ForegroundColor Cyan
+$metricAlerts = Get-AzMetricAlertRuleV2 -ErrorAction SilentlyContinue
+$activityLogAlerts = Get-AzActivityLogAlert -ErrorAction SilentlyContinue
+$totalAlertRules = ($metricAlerts | Measure-Object).Count + ($activityLogAlerts | Measure-Object).Count
+
+$actionGroups = Get-AzActionGroup -ErrorAction SilentlyContinue
+
+Add-Finding -Control "Alert rules configured (metric + activity log)" `
+    -Status "$totalAlertRules rule(s) found" `
+    -Evidence "$(($metricAlerts | Measure-Object).Count) metric alert rule(s), $(($activityLogAlerts | Measure-Object).Count) activity log alert rule(s)." `
+    -SuggestedNote "Rule count alone says nothing about coverage quality — a handful of well-targeted alerts on critical systems beats dozens of noisy, ignored ones."
+
+$rulesWithoutActionGroup = @()
+foreach ($rule in $metricAlerts) {
+    if (-not $rule.Actions -or $rule.Actions.Count -eq 0) { $rulesWithoutActionGroup += $rule.Name }
+}
+
+Add-Finding -Control "Alert rules with NO action group attached (silent alerts)" `
+    -Status $(if ($rulesWithoutActionGroup) { "Attention needed — $($rulesWithoutActionGroup.Count) rule(s)" } else { "None found (good)" }) `
+    -Evidence $(if ($rulesWithoutActionGroup) { $rulesWithoutActionGroup -join "; " } else { "All checked metric alert rules have at least one action configured." }) `
+    -SuggestedNote $(if ($rulesWithoutActionGroup) {
+        "An alert rule with no action group fires and does nothing — it will show up in the Azure Portal if someone happens to look, but nobody gets paged or emailed. This is a common false sense of security: 'we have alerting' when in practice nobody is notified."
+    } else { "N/A" })
+
+Add-Finding -Control "Action groups configured (notification targets)" `
+    -Status "$(($actionGroups | Measure-Object).Count) action group(s) found" `
+    -Evidence $(if ($actionGroups) { ($actionGroups | ForEach-Object { "$($_.Name) ($($_.Receivers.EmailReceivers.Count) email / $($_.Receivers.SmsReceivers.Count) SMS / $($_.Receivers.WebhookReceivers.Count) webhook receiver(s))" }) -join "; " } else { "No action groups found in this subscription." }) `
+    -SuggestedNote "Check that receivers are current — action groups pointing at a distribution list nobody monitors, or a person who has left, are a common and easy-to-miss gap."
+
+# ---------------------------------------------------------------------------
+# 6. Microsoft Defender for Cloud plans — active threat protection vs Free tier
+# ---------------------------------------------------------------------------
+Write-Host "Checking Microsoft Defender for Cloud pricing tiers..." -ForegroundColor Cyan
+$pricingPlans = Get-AzSecurityPricing -ErrorAction SilentlyContinue
+
+$freeTierPlans = $pricingPlans | Where-Object { $_.PricingTier -eq "Free" }
+
+Add-Finding -Control "Microsoft Defender for Cloud plans on Free tier (no active threat detection)" `
+    -Status $(if ($freeTierPlans) { "Attention needed — $($freeTierPlans.Count) plan(s) on Free tier" } else { "All plans on a paid tier" }) `
+    -Evidence $(if ($freeTierPlans) { ($freeTierPlans | ForEach-Object { $_.Name }) -join "; " } else { "No plans found on the Free tier." }) `
+    -SuggestedNote $(if ($freeTierPlans) {
+        "Free tier gives basic security recommendations but NOT the active threat detection alerts (e.g. anomalous sign-ins, malware, suspicious process execution) that the paid Defender plans provide for that resource type. If any of these resource types support a critical or important function, this is a genuine detection gap, not just a cost-optimisation choice."
+    } else { "N/A" })
+
+# ---------------------------------------------------------------------------
+# 7. Output
+# ---------------------------------------------------------------------------
+$findings | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== DORA Evidence Report (Article 10 — Detection) ===" -ForegroundColor Yellow
+$findings | Format-Table Control, Status -AutoSize -Wrap
+Write-Host ""
+Write-Host "Full report with evidence and notes written to: $OutputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "REMINDER: This report is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "The 'alert rules with no action group' and 'Free tier' findings above are" -ForegroundColor Red
+Write-Host "the ones most likely to reveal a false sense of security — logging and even" -ForegroundColor Red
+Write-Host "alerting can exist while nobody is actually notified. A human still needs to" -ForegroundColor Red
+Write-Host "confirm alert thresholds are meaningful and that notified teams act on them." -ForegroundColor Red
+
+Disconnect-AzAccount | Out-Null
