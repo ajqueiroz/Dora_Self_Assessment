@@ -1,0 +1,228 @@
+#Requires -Modules Microsoft.Graph.Identity.SignIns, Microsoft.Graph.Users, Microsoft.Graph.Identity.DirectoryManagement
+
+<#
+.SYNOPSIS
+    DORA technical-evidence collector — Conditional Access / MFA (Article 9) +
+    Azure Policy's built-in DORA Regulatory Compliance initiative.
+
+.DESCRIPTION
+    This is a SMALL, DELIBERATELY LIMITED example of an "evidence-gathering" script
+    for the DORA Self-Assessment Tool. It does NOT answer Yes/Partly/No for you.
+
+    Part 1 connects to Microsoft Graph (read-only) and inspects your tenant's
+    Conditional Access policies for MFA enforcement (Article 9).
+
+    Part 2 (optional, requires the Az module and a subscription) looks up Microsoft's
+    own built-in Azure Policy "Regulatory Compliance" initiative for DORA and, if it's
+    assigned in your subscription, reports its current compliance percentage and any
+    non-compliant controls. IMPORTANT: this reflects MICROSOFT'S OWN mapping of DORA
+    requirements to Azure technical controls — it uses Microsoft's control names, not
+    the workbook's Article/Section numbers, and it only covers infrastructure
+    configuration, not governance, policy, or contractual requirements. Treat it as a
+    second, independent source of evidence, not a translation of the workbook.
+
+    Permissions required (read-only, delegated):
+        Policy.Read.All, Directory.Read.All, User.Read.All   (for Part 1, Graph)
+        Reader on the subscription                            (for Part 2, Azure Policy)
+
+.NOTES
+    Run this on a machine with internet access to Microsoft Graph and Azure Resource
+    Manager. Both parts authenticate interactively by default — you'll get a browser
+    sign-in prompt for each. No credentials are stored by this script.
+
+.OUTPUTS
+    Two CSV reports: .\DORA-Evidence-Report.csv (Part 1) and
+    .\DORA-AzurePolicy-Report.csv (Part 2, if run), plus console summaries.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = ".\DORA-Evidence-Report.csv",
+    [string]$AzurePolicyOutputPath = ".\DORA-AzurePolicy-Report.csv",
+    [switch]$SkipAzurePolicyCheck
+)
+
+# ---------------------------------------------------------------------------
+# 1. Connect (read-only scopes — this script never writes anything to your tenant)
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to Microsoft Graph (read-only)..." -ForegroundColor Cyan
+Connect-MgGraph -Scopes "Policy.Read.All", "Directory.Read.All", "User.Read.All" -NoWelcome
+
+$tenantInfo = Get-MgOrganization | Select-Object -First 1
+Write-Host "Connected to tenant: $($tenantInfo.DisplayName)" -ForegroundColor Green
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# 2. Gather evidence: Conditional Access policies
+# ---------------------------------------------------------------------------
+Write-Host "Retrieving Conditional Access policies..." -ForegroundColor Cyan
+$caPolicies = Get-MgIdentityConditionalAccessPolicy -All
+
+$findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+# --- Finding 1: Is there ANY enabled policy that requires MFA for all users? ---
+$mfaAllUsersPolicies = $caPolicies | Where-Object {
+    $_.State -eq "enabled" -and
+    $_.Conditions.Users.IncludeUsers -contains "All" -and
+    $_.GrantControls.BuiltInControls -contains "mfa"
+}
+
+$findings.Add([PSCustomObject]@{
+    Article       = 9
+    Section       = "1"
+    Topic         = "ICT Risk management"
+    Control       = "MFA required for all users (Conditional Access)"
+    Status        = if ($mfaAllUsersPolicies) { "Evidence found" } else { "No matching policy found" }
+    Evidence      = if ($mfaAllUsersPolicies) {
+                        ($mfaAllUsersPolicies | ForEach-Object { $_.DisplayName }) -join "; "
+                     } else {
+                        "No enabled Conditional Access policy targets 'All users' with an MFA grant control."
+                     }
+    SuggestedNote = if ($mfaAllUsersPolicies) {
+                        "Technical control present. Confirm scope matches your definition of 'all users' (guests, service accounts, break-glass exclusions) before marking Yes."
+                     } else {
+                        "No blanket MFA policy found. Check per-role or per-app policies below, or legacy per-user MFA, before concluding this is a gap."
+                     }
+})
+
+# --- Finding 2: Is MFA required for privileged/admin roles specifically? ---
+$mfaAdminPolicies = $caPolicies | Where-Object {
+    $_.State -eq "enabled" -and
+    $_.Conditions.Users.IncludeRoles.Count -gt 0 -and
+    $_.GrantControls.BuiltInControls -contains "mfa"
+}
+
+$findings.Add([PSCustomObject]@{
+    Article       = 9
+    Section       = "1"
+    Topic         = "ICT Risk management"
+    Control       = "MFA required for privileged/admin roles (Conditional Access)"
+    Status        = if ($mfaAdminPolicies) { "Evidence found" } else { "No matching policy found" }
+    Evidence      = if ($mfaAdminPolicies) {
+                        ($mfaAdminPolicies | ForEach-Object { $_.DisplayName }) -join "; "
+                     } else {
+                        "No enabled Conditional Access policy specifically targets directory roles with an MFA grant control."
+                     }
+    SuggestedNote = if ($mfaAdminPolicies) {
+                        "Technical control present for privileged roles."
+                     } else {
+                        "If the 'all users' policy above already covers admins, this may still be satisfied indirectly — verify role coverage."
+                     }
+})
+
+# --- Finding 3: Are there any DISABLED or report-only policies that should be reviewed? ---
+$reportOnlyPolicies = $caPolicies | Where-Object { $_.State -eq "enabledForReportingButNotEnforced" }
+
+$findings.Add([PSCustomObject]@{
+    Article       = 9
+    Section       = "1"
+    Topic         = "ICT Risk management"
+    Control       = "Conditional Access policies in report-only mode (not enforced)"
+    Status        = if ($reportOnlyPolicies) { "Attention needed" } else { "None found" }
+    Evidence      = if ($reportOnlyPolicies) {
+                        ($reportOnlyPolicies | ForEach-Object { $_.DisplayName }) -join "; "
+                     } else {
+                        "No policies are sitting in report-only mode."
+                     }
+    SuggestedNote = if ($reportOnlyPolicies) {
+                        "These policies are logging but NOT blocking access. If any of these were intended to satisfy an MFA/protection requirement, it is not yet actually enforced."
+                     } else {
+                        "N/A"
+                     }
+})
+
+# ---------------------------------------------------------------------------
+# 3. Output
+# ---------------------------------------------------------------------------
+$findings | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== DORA Evidence Report (Article 9 — Protection, Conditional Access / MFA) ===" -ForegroundColor Yellow
+$findings | Format-Table Article, Section, Control, Status -AutoSize
+Write-Host ""
+Write-Host "Full report with evidence and notes written to: $OutputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "REMINDER: This report is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "Use it to inform the 'Do you meet the requirements today?' column in the" -ForegroundColor Red
+Write-Host "ICT Risk Management sheet — a human still needs to review scope, exclusions," -ForegroundColor Red
+Write-Host "and whether the policy design actually meets the intent of Article 9." -ForegroundColor Red
+
+Disconnect-MgGraph | Out-Null
+
+# ---------------------------------------------------------------------------
+# 4. OPTIONAL: Microsoft's own built-in Azure Policy "Regulatory Compliance"
+#    initiative for DORA — a second, independent evidence source.
+# ---------------------------------------------------------------------------
+if (-not $SkipAzurePolicyCheck) {
+    Write-Host ""
+    Write-Host "----------------------------------------------------------------------" -ForegroundColor Cyan
+    Write-Host "Checking for Microsoft's built-in Azure Policy DORA initiative..." -ForegroundColor Cyan
+    Write-Host "(This requires the 'Az.PolicyInsights' and 'Az.Resources' modules and" -ForegroundColor Cyan
+    Write-Host " a separate sign-in to Azure Resource Manager.)" -ForegroundColor Cyan
+    Write-Host "----------------------------------------------------------------------" -ForegroundColor Cyan
+
+    if (-not (Get-Module -ListAvailable -Name Az.Resources) -or -not (Get-Module -ListAvailable -Name Az.PolicyInsights)) {
+        Write-Warning "Az.Resources / Az.PolicyInsights not installed. Skipping Azure Policy check. Install with: Install-Module Az -Scope CurrentUser"
+    }
+    else {
+        Connect-AzAccount | Out-Null
+        $context = Get-AzContext
+        Write-Host "Connected to subscription: $($context.Subscription.Name)" -ForegroundColor Green
+
+        # Microsoft's built-in Regulatory Compliance initiatives are tagged with
+        # category "Regulatory Compliance". We search by display name for DORA.
+        $doraInitiative = Get-AzPolicySetDefinition -Builtin |
+            Where-Object { $_.Properties.DisplayName -match "DORA|Digital Operational Resilience" }
+
+        if (-not $doraInitiative) {
+            Write-Warning "No built-in 'DORA' Regulatory Compliance initiative found via Get-AzPolicySetDefinition in this tenant/region. Availability of specific built-in initiatives can vary — check the Azure Policy portal under Definitions, category 'Regulatory Compliance', or Microsoft Defender for Cloud's Regulatory Compliance dashboard directly."
+        }
+        else {
+            $azFindings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+            foreach ($initiative in $doraInitiative) {
+                Write-Host "Found initiative: $($initiative.Properties.DisplayName)" -ForegroundColor Green
+
+                # Check if it's actually ASSIGNED anywhere in this subscription —
+                # the definition existing does not mean it's been assigned/evaluated.
+                $assignments = Get-AzPolicyAssignment | Where-Object {
+                    $_.Properties.PolicyDefinitionId -eq $initiative.PolicySetDefinitionId
+                }
+
+                if (-not $assignments) {
+                    $azFindings.Add([PSCustomObject]@{
+                        Source        = "Azure Policy (Microsoft mapping)"
+                        Initiative    = $initiative.Properties.DisplayName
+                        Status        = "Defined but NOT assigned"
+                        ComplianceState = "N/A"
+                        Note          = "This initiative exists in the built-in library but is not currently assigned to this subscription, so there is no live compliance data to report. Assigning it (Azure Portal > Policy > Definitions > search 'DORA' > Assign) will let Defender for Cloud's Regulatory Compliance dashboard evaluate it against your resources."
+                    })
+                }
+                else {
+                    foreach ($assignment in $assignments) {
+                        $states = Get-AzPolicyState -PolicyAssignmentName $assignment.Name -Filter "PolicySetDefinitionId eq '$($initiative.PolicySetDefinitionId)'"
+                        $compliantCount = ($states | Where-Object { $_.ComplianceState -eq 'Compliant' }).Count
+                        $nonCompliantCount = ($states | Where-Object { $_.ComplianceState -eq 'NonCompliant' }).Count
+                        $total = $compliantCount + $nonCompliantCount
+                        $pct = if ($total -gt 0) { [math]::Round(($compliantCount / $total) * 100, 1) } else { 0 }
+
+                        $azFindings.Add([PSCustomObject]@{
+                            Source          = "Azure Policy (Microsoft mapping)"
+                            Initiative      = $initiative.Properties.DisplayName
+                            Status          = "Assigned: $($assignment.Properties.DisplayName)"
+                            ComplianceState = "$pct% ($compliantCount compliant / $nonCompliantCount non-compliant)"
+                            Note            = "This is Microsoft's OWN control mapping, not the workbook's Article/Section scheme. Non-compliant resources are itemised in the Defender for Cloud > Regulatory Compliance dashboard — cross-reference those against the relevant workbook question manually."
+                        })
+                    }
+                }
+            }
+
+            $azFindings | Export-Csv -Path $AzurePolicyOutputPath -NoTypeInformation -Encoding UTF8
+            Write-Host ""
+            $azFindings | Format-Table Initiative, Status, ComplianceState -AutoSize
+            Write-Host "Azure Policy findings written to: $AzurePolicyOutputPath" -ForegroundColor Green
+        }
+
+        Disconnect-AzAccount | Out-Null
+    }
+}
