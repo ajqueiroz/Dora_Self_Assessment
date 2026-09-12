@@ -1,0 +1,192 @@
+#Requires -Modules Az.Accounts, Az.Resources, Az.Compute
+
+<#
+.SYNOPSIS
+    DORA technical-evidence collector — ICT Asset Inventory & Classification (Article 8).
+
+.DESCRIPTION
+    This is a SMALL, DELIBERATELY LIMITED evidence-gathering script for the DORA
+    Self-Assessment Tool. It does NOT answer Yes/Partly/No for you.
+
+    Article 8 requires financial entities to identify, classify, and document all
+    ICT assets and information assets — and, distinctively, to specifically risk-
+    assess LEGACY ICT systems (Article 8(6)). This script checks three things that
+    tend to be assumed rather than verified:
+
+        1. Is there actually a complete, queryable inventory (vs. tribal knowledge)?
+        2. Are assets classified at all (tags for owner, criticality, environment)?
+        3. Are any systems running end-of-support software — the Article 8(6) check?
+
+    A human still has to decide whether your tagging taxonomy actually reflects a
+    meaningful criticality classification (a tag existing is not the same as the
+    classification being accurate or reviewed), and whether resources outside Azure
+    (on-premises, other clouds, SaaS) are separately inventoried — this script only
+    sees what's in this Azure subscription.
+
+    Permissions required (read-only):
+        Reader on the subscription(s) you want to check
+
+.NOTES
+    Run this against ONE subscription at a time (pass -SubscriptionId, or loop over
+    Get-AzSubscription yourself for multiple).
+
+    The end-of-support OS detection in Part 4 uses a small, HARDCODED watchlist of
+    well-known end-of-support OS families (see $EolOsPatterns below). This list will
+    go stale — Microsoft, Canonical, Red Hat etc. retire support for new versions
+    every year. Treat a "clean" result with suspicion if you haven't updated this
+    list recently, and treat a match as a strong lead to verify, not a certainty.
+
+.OUTPUTS
+    A CSV report at .\DORA-Evidence-AssetInventory.csv and a console summary.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = ".\DORA-Evidence-AssetInventory.csv",
+    [string]$SubscriptionId,
+    [string[]]$RequiredClassificationTags = @("Owner", "Environment", "CriticalityTier")
+)
+
+# A small, deliberately maintained-by-you watchlist. Extend this as OS versions age out.
+# Matches are done against the VM's image Offer/Sku/Publisher and OS disk name — best-effort.
+$EolOsPatterns = @(
+    "2008", "2008R2", "2012", "WindowsServer2012",
+    "ubuntu-14_04", "ubuntu-16_04", "18_04-lts",
+    "centos-7", "centos-8", "CentOS",
+    "debian-9", "debian-10"
+)
+
+# ---------------------------------------------------------------------------
+# 1. Connect (read-only)
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+if ($SubscriptionId) {
+    Connect-AzAccount -Subscription $SubscriptionId | Out-Null
+} else {
+    Connect-AzAccount | Out-Null
+}
+
+$context = Get-AzContext
+Write-Host "Connected to subscription: $($context.Subscription.Name) ($($context.Subscription.Id))" -ForegroundColor Green
+Write-Host ""
+
+$findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Finding {
+    param($Control, $Status, $Evidence, $SuggestedNote, $Section = "1")
+    $findings.Add([PSCustomObject]@{
+        Article       = 8
+        Section       = $Section
+        Topic         = "ICT Risk management"
+        Control       = $Control
+        Status        = $Status
+        Evidence      = $Evidence
+        SuggestedNote = $SuggestedNote
+    })
+}
+
+# ---------------------------------------------------------------------------
+# 2. Full resource inventory — the baseline "do you actually know what you have"
+# ---------------------------------------------------------------------------
+Write-Host "Retrieving full resource inventory..." -ForegroundColor Cyan
+
+$useResourceGraph = Get-Module -ListAvailable -Name Az.ResourceGraph
+if ($useResourceGraph) {
+    Import-Module Az.ResourceGraph -ErrorAction SilentlyContinue
+    $allResources = Search-AzGraph -Query "Resources | project id, name, type, resourceGroup, tags, location" -First 1000
+} else {
+    Write-Warning "Az.ResourceGraph not installed — falling back to Get-AzResource (slower for large subscriptions). Install-Module Az.ResourceGraph for faster, more complete queries."
+    $allResources = Get-AzResource
+}
+
+$totalCount = ($allResources | Measure-Object).Count
+$typeBreakdown = $allResources | Group-Object -Property type | Sort-Object Count -Descending | Select-Object -First 10
+
+Add-Finding -Control "Total resource count (this subscription)" `
+    -Status "Evidence found — $totalCount resource(s)" `
+    -Evidence "Top resource types: $(($typeBreakdown | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join '; ')" `
+    -SuggestedNote "This is a raw count from Azure's own resource graph, not your documented inventory. Compare this number against your existing ICT asset register — a mismatch (Azure showing resources your register doesn't list, or vice versa) is itself a finding worth investigating."
+
+# ---------------------------------------------------------------------------
+# 3. Tagging / classification coverage
+# ---------------------------------------------------------------------------
+Write-Host "Checking tagging and classification coverage..." -ForegroundColor Cyan
+
+$untaggedResources = $allResources | Where-Object { -not $_.Tags -and -not $_.tags }
+$untaggedCount = ($untaggedResources | Measure-Object).Count
+
+Add-Finding -Control "Resources with NO tags at all" `
+    -Status $(if ($untaggedCount -gt 0) { "Attention needed — $untaggedCount / $totalCount untagged" } else { "All resources have at least one tag" }) `
+    -Evidence $(if ($untaggedCount -gt 0) { "$untaggedCount resource(s) carry zero tags, meaning no recorded owner, environment, or criticality." } else { "N/A" }) `
+    -SuggestedNote "A resource with no tags cannot be classified by criticality, which Article 8 requires. This does not mean it's unimportant — it means nobody has recorded whether it is."
+
+foreach ($tagKey in $RequiredClassificationTags) {
+    $missingTag = $allResources | Where-Object {
+        $tagBag = if ($_.Tags) { $_.Tags } else { $_.tags }
+        -not $tagBag -or -not $tagBag.PSObject.Properties.Name.Contains($tagKey)
+    }
+    $missingCount = ($missingTag | Measure-Object).Count
+
+    Add-Finding -Control "Resources missing the '$tagKey' classification tag" `
+        -Status $(if ($missingCount -gt 0) { "Attention needed — $missingCount / $totalCount missing" } else { "All resources tagged" }) `
+        -Evidence $(if ($missingCount -gt 0) { "$missingCount resource(s) have no '$tagKey' tag." } else { "N/A" }) `
+        -SuggestedNote "This script checks for the presence of a '$tagKey' tag specifically because it was passed in -RequiredClassificationTags. Adjust that parameter to match your organization's actual tagging taxonomy — the tag names here are a common example, not a DORA-mandated standard."
+}
+
+# ---------------------------------------------------------------------------
+# 4. Legacy / end-of-support systems — the Article 8(6)-specific check
+# ---------------------------------------------------------------------------
+Write-Host "Scanning for potentially end-of-support operating systems..." -ForegroundColor Cyan
+
+$allVMs = Get-AzVM -Status -ErrorAction SilentlyContinue
+$flaggedVMs = @()
+
+foreach ($vm in $allVMs) {
+    $imageRef = $vm.StorageProfile.ImageReference
+    $osDiskName = $vm.StorageProfile.OsDisk.Name
+    $searchString = "$($imageRef.Offer) $($imageRef.Sku) $($imageRef.Publisher) $osDiskName"
+
+    foreach ($pattern in $EolOsPatterns) {
+        if ($searchString -match [regex]::Escape($pattern)) {
+            $flaggedVMs += "$($vm.Name) (matched pattern: '$pattern')"
+            break
+        }
+    }
+}
+
+Add-Finding -Control "VMs potentially running end-of-support operating systems" `
+    -Status $(if ($flaggedVMs) { "Attention needed — $($flaggedVMs.Count) VM(s) flagged" } else { "None matched the watchlist" }) `
+    -Evidence $(if ($flaggedVMs) { $flaggedVMs -join "; " } else { "No VMs matched the hardcoded EOL watchlist. This does NOT guarantee all systems are current — see SuggestedNote." }) `
+    -SuggestedNote "This is a best-effort pattern match against a small, manually maintained watchlist (see the script's `$EolOsPatterns` list) — it WILL miss OS versions that have gone end-of-support since this script was last updated, and won't catch anything outside Azure VMs (on-premises servers, PaaS runtime versions, container base images). Article 8(6) specifically requires a risk assessment of legacy ICT systems — treat this as a starting prompt, not a complete answer."
+
+# ---------------------------------------------------------------------------
+# 5. Network asset inventory (part of Article 8(1) — network resources)
+# ---------------------------------------------------------------------------
+Write-Host "Counting network assets..." -ForegroundColor Cyan
+$vnets = Get-AzResource -ResourceType "Microsoft.Network/virtualNetworks" -ErrorAction SilentlyContinue
+$nsgs = Get-AzResource -ResourceType "Microsoft.Network/networkSecurityGroups" -ErrorAction SilentlyContinue
+$publicIps = Get-AzResource -ResourceType "Microsoft.Network/publicIPAddresses" -ErrorAction SilentlyContinue
+
+Add-Finding -Control "Network resource inventory (VNets / NSGs / Public IPs)" `
+    -Status "Evidence found" `
+    -Evidence "$(($vnets | Measure-Object).Count) virtual network(s), $(($nsgs | Measure-Object).Count) network security group(s), $(($publicIps | Measure-Object).Count) public IP address(es)." `
+    -SuggestedNote "Article 8(1) requires network resources to be part of your documented ICT asset inventory. Cross-reference this count against your network diagrams/documentation — a public IP nobody remembers assigning is a common finding here."
+
+# ---------------------------------------------------------------------------
+# 6. Output
+# ---------------------------------------------------------------------------
+$findings | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== DORA Evidence Report (Article 8 — ICT Asset Identification) ===" -ForegroundColor Yellow
+$findings | Format-Table Control, Status -AutoSize -Wrap
+Write-Host ""
+Write-Host "Full report with evidence and notes written to: $OutputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "REMINDER: This report is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "The end-of-support OS check uses a small, manually maintained watchlist that" -ForegroundColor Red
+Write-Host "WILL go stale — a clean result here is not proof all systems are current." -ForegroundColor Red
+Write-Host "This script also only sees Azure. On-premises, other clouds, and SaaS assets" -ForegroundColor Red
+Write-Host "need a separate inventory process to satisfy Article 8's full scope." -ForegroundColor Red
+
+Disconnect-AzAccount | Out-Null
