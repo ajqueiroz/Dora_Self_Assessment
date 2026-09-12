@@ -1,0 +1,209 @@
+#Requires -Modules Az.Accounts, Az.RecoveryServices, Az.Compute, Az.Storage, Az.Sql
+
+<#
+.SYNOPSIS
+    DORA technical-evidence collector — Backup & Recovery (Article 12).
+
+.DESCRIPTION
+    This is a SMALL, DELIBERATELY LIMITED evidence-gathering script for the DORA
+    Self-Assessment Tool. It does NOT answer Yes/Partly/No for you.
+
+    It connects to Azure Resource Manager (read-only) and inspects backup posture
+    across Recovery Services vaults, virtual machines, and Azure SQL databases in
+    the CURRENT subscription context, producing a report tagged to Article 12
+    (ICT Business continuity policy — backup policies and restoration procedures).
+
+    The single most important thing this script checks — and the one most self-
+    assessments get wrong — is NOT "do backups exist" but "has anyone ever actually
+    tested a RESTORE". A vault with years of successful nightly backup jobs and zero
+    restore jobs is a common and serious gap: nobody knows if the backups are usable
+    until the day they're needed.
+
+    A human still has to review scope, retention adequacy against your recovery
+    point objectives (RPO), and whether critical or important functions specifically
+    are covered — this script only reports what exists, not whether it's sufficient.
+
+    Permissions required (read-only):
+        Reader on the subscription(s) you want to check
+        (Recovery Services vaults, VMs, Storage accounts, SQL databases)
+
+.NOTES
+    Run this against ONE subscription at a time. If you have multiple subscriptions,
+    loop this script with -SubscriptionId for each one, or extend the script to
+    iterate Get-AzSubscription yourself.
+
+    This checks Azure Backup (Recovery Services vaults) and Azure SQL's built-in
+    backup retention. It does NOT check Microsoft 365 backup (Exchange/SharePoint/
+    OneDrive retention), on-premises backup solutions, or third-party backup tools —
+    those need separate checks against the relevant product's own API.
+
+.OUTPUTS
+    A CSV report at .\DORA-Evidence-BackupRecovery.csv and a console summary.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = ".\DORA-Evidence-BackupRecovery.csv",
+    [string]$SubscriptionId
+)
+
+# ---------------------------------------------------------------------------
+# 1. Connect (read-only — this script never creates, modifies, or deletes
+#    backups, policies, or restore jobs)
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+if ($SubscriptionId) {
+    Connect-AzAccount -Subscription $SubscriptionId | Out-Null
+} else {
+    Connect-AzAccount | Out-Null
+}
+
+$context = Get-AzContext
+Write-Host "Connected to subscription: $($context.Subscription.Name) ($($context.Subscription.Id))" -ForegroundColor Green
+Write-Host ""
+
+$findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Finding {
+    param($Control, $Status, $Evidence, $SuggestedNote, $Section = "1")
+    $findings.Add([PSCustomObject]@{
+        Article       = 12
+        Section       = $Section
+        Topic         = "ICT Risk management"
+        Control       = $Control
+        Status        = $Status
+        Evidence      = $Evidence
+        SuggestedNote = $SuggestedNote
+    })
+}
+
+# ---------------------------------------------------------------------------
+# 2. Recovery Services vaults — policies, protected items, job history
+# ---------------------------------------------------------------------------
+Write-Host "Retrieving Recovery Services vaults..." -ForegroundColor Cyan
+$vaults = Get-AzRecoveryServicesVault
+
+if (-not $vaults) {
+    Add-Finding -Control "Recovery Services vault present" `
+        -Status "No matching resource found" `
+        -Evidence "No Recovery Services vaults found in this subscription." `
+        -SuggestedNote "If backups are managed elsewhere (another subscription, Azure Backup vault [newer resource type], on-premises, or a third-party tool), this script will not see them. Confirm where backups actually live before concluding this is a gap."
+} else {
+    foreach ($vault in $vaults) {
+        Write-Host "  Vault: $($vault.Name)" -ForegroundColor Yellow
+        Set-AzRecoveryServicesVaultContext -Vault $vault
+
+        # --- Backup policies and retention ---
+        $policies = Get-AzRecoveryServicesBackupProtectionPolicy
+        $policySummary = if ($policies) {
+            ($policies | ForEach-Object { "$($_.Name) [$($_.WorkloadType), retention varies by policy]" }) -join "; "
+        } else { "No backup policies defined in this vault." }
+
+        Add-Finding -Control "Backup policies configured (vault: $($vault.Name))" `
+            -Status $(if ($policies) { "Evidence found" } else { "No policies found" }) `
+            -Evidence $policySummary `
+            -SuggestedNote "Check each policy's retention period against your organization's defined Recovery Point Objective (RPO) — a policy existing does not mean its retention window is adequate."
+
+        # --- Protected items (what's actually covered) ---
+        $protectedItems = Get-AzRecoveryServicesBackupItem -BackupManagementType AzureVM -WorkloadType AzureVM -ErrorAction SilentlyContinue
+        $itemCount = if ($protectedItems) { $protectedItems.Count } else { 0 }
+
+        Add-Finding -Control "VMs protected under backup (vault: $($vault.Name))" `
+            -Status "$itemCount item(s) protected" `
+            -Evidence $(if ($protectedItems) { ($protectedItems | ForEach-Object { $_.Name }) -join "; " } else { "No protected VM items in this vault." }) `
+            -SuggestedNote "Cross-reference against the full VM inventory finding below to identify VMs that exist but are NOT covered by any backup."
+
+        # --- THE KEY CHECK: has a restore ever actually been tested? ---
+        $restoreJobs = Get-AzRecoveryServicesBackupJob -Operation Restore -ErrorAction SilentlyContinue
+        $successfulRestores = $restoreJobs | Where-Object { $_.Status -eq "Completed" }
+
+        Add-Finding -Control "Restore capability actually tested (vault: $($vault.Name))" `
+            -Section "1" `
+            -Status $(if ($successfulRestores) { "Evidence found" } else { "NO EVIDENCE — potential gap" }) `
+            -Evidence $(if ($successfulRestores) {
+                            $mostRecent = $successfulRestores | Sort-Object StartTime -Descending | Select-Object -First 1
+                            "$($successfulRestores.Count) successful restore job(s) found. Most recent: $($mostRecent.StartTime)."
+                        } else {
+                            "No completed restore jobs found in this vault's job history."
+                        }) `
+            -SuggestedNote $(if ($successfulRestores) {
+                                "Confirm the most recent restore test date is within your organization's defined testing cadence — a restore tested once, years ago, is materially different from a regularly tested one."
+                             } else {
+                                "This is the single most common backup-related gap: backups exist and run successfully, but nobody has proven they can be restored. Article 12 concerns restoration procedures, not just backup existence. Consider this a strong candidate for 'Partly' or 'No' rather than 'Yes', regardless of how healthy the backup job history looks above."
+                             })
+
+        # --- Recent backup job health (last 30 days) ---
+        $recentJobs = Get-AzRecoveryServicesBackupJob -Operation Backup -From (Get-Date).AddDays(-30) -ErrorAction SilentlyContinue
+        $failedRecent = $recentJobs | Where-Object { $_.Status -eq "Failed" }
+
+        Add-Finding -Control "Recent backup job health, last 30 days (vault: $($vault.Name))" `
+            -Status $(if ($failedRecent) { "Attention needed" } else { "Healthy" }) `
+            -Evidence "$($recentJobs.Count) backup job(s) in last 30 days; $($failedRecent.Count) failed." `
+            -SuggestedNote $(if ($failedRecent) { "Investigate failed jobs — an item can look 'protected' while its actual backups have been silently failing." } else { "N/A" })
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Gap detection: VMs that exist but aren't in ANY vault's protected items
+# ---------------------------------------------------------------------------
+Write-Host "Cross-checking VM inventory against backup coverage..." -ForegroundColor Cyan
+$allVMs = Get-AzVM
+$allProtectedNames = @()
+foreach ($vault in $vaults) {
+    Set-AzRecoveryServicesVaultContext -Vault $vault
+    $items = Get-AzRecoveryServicesBackupItem -BackupManagementType AzureVM -WorkloadType AzureVM -ErrorAction SilentlyContinue
+    if ($items) { $allProtectedNames += $items.Name }
+}
+$unprotectedVMs = $allVMs | Where-Object { $allProtectedNames -notcontains $_.Name }
+
+Add-Finding -Control "VMs with NO backup coverage in any vault" `
+    -Status $(if ($unprotectedVMs) { "Attention needed" } else { "All VMs covered" }) `
+    -Evidence $(if ($unprotectedVMs) { ($unprotectedVMs | ForEach-Object { $_.Name }) -join "; " } else { "All $($allVMs.Count) VM(s) in this subscription appear in at least one vault's protected items." }) `
+    -SuggestedNote $(if ($unprotectedVMs) { "Confirm whether these VMs are genuinely out of scope for backup (e.g. stateless/ephemeral compute) or represent a real gap." } else { "N/A" })
+
+# ---------------------------------------------------------------------------
+# 4. Azure SQL Database backup retention (separate from Recovery Services)
+# ---------------------------------------------------------------------------
+Write-Host "Checking Azure SQL Database backup retention..." -ForegroundColor Cyan
+$sqlServers = Get-AzSqlServer -ErrorAction SilentlyContinue
+
+if ($sqlServers) {
+    foreach ($server in $sqlServers) {
+        $databases = Get-AzSqlDatabase -ServerName $server.ServerName -ResourceGroupName $server.ResourceGroupName |
+            Where-Object { $_.DatabaseName -ne "master" }
+
+        foreach ($db in $databases) {
+            $shortTerm = Get-AzSqlDatabaseBackupShortTermRetentionPolicy -ServerName $server.ServerName -ResourceGroupName $server.ResourceGroupName -DatabaseName $db.DatabaseName -ErrorAction SilentlyContinue
+            $longTerm = Get-AzSqlDatabaseBackupLongTermRetentionPolicy -ServerName $server.ServerName -ResourceGroupName $server.ResourceGroupName -DatabaseName $db.DatabaseName -ErrorAction SilentlyContinue
+
+            Add-Finding -Control "Azure SQL backup retention: $($server.ServerName)/$($db.DatabaseName)" `
+                -Status "Evidence found" `
+                -Evidence "Short-term (PITR) retention: $($shortTerm.RetentionDays) days. Long-term retention configured: $($null -ne $longTerm.WeeklyRetention -or $null -ne $longTerm.MonthlyRetention -or $null -ne $longTerm.YearlyRetention)." `
+                -SuggestedNote "Azure SQL's built-in point-in-time restore is automatic, but confirm long-term retention is configured if this database supports a critical or important function requiring longer retention than the default."
+        }
+    }
+} else {
+    Add-Finding -Control "Azure SQL Database backup retention" `
+        -Status "No matching resource found" `
+        -Evidence "No Azure SQL servers found in this subscription." `
+        -SuggestedNote "N/A if this subscription does not host SQL databases supporting in-scope functions."
+}
+
+# ---------------------------------------------------------------------------
+# 5. Output
+# ---------------------------------------------------------------------------
+$findings | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== DORA Evidence Report (Article 12 — Backup & Recovery) ===" -ForegroundColor Yellow
+$findings | Format-Table Control, Status -AutoSize -Wrap
+Write-Host ""
+Write-Host "Full report with evidence and notes written to: $OutputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "REMINDER: This report is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "The 'restore capability tested' finding above is the most important one" -ForegroundColor Red
+Write-Host "in this report — backups existing is not the same as backups being usable." -ForegroundColor Red
+Write-Host "A human still needs to review retention adequacy, RPO/RTO alignment, and" -ForegroundColor Red
+Write-Host "whether coverage matches your organization's critical/important functions." -ForegroundColor Red
+
+Disconnect-AzAccount | Out-Null
