@@ -1,0 +1,223 @@
+<#
+.SYNOPSIS
+    DORA Evidence Collection — orchestrator. Runs all nine evidence-gathering
+    scripts in this set and merges their output into one master CSV.
+
+.DESCRIPTION
+    This script does NOT gather evidence itself. It calls the nine individual
+    DORA-Evidence-*.ps1 scripts in this folder, one after another, and then
+    combines every CSV they produce into a single DORA-Evidence-MASTER.csv,
+    sorted by DORA Article and Section, with a SourceScript column added so you
+    can trace every row back to where it came from.
+
+    It does NOT answer Yes/Partly/No for you, and it does NOT write anything
+    back into the DORA Self-Assessment workbook. See
+    "DORA-Evidence-Scripts-README.md" in this folder for the full explanation
+    of what these scripts are, what they check, and how to use the output.
+
+    WHY A SEPARATE ORCHESTRATOR AND NOT ONE BIG SCRIPT: each of the nine scripts
+    is independently runnable and independently documented, with its own
+    .SYNOPSIS/.DESCRIPTION/.NOTES explaining exactly what it checks and what its
+    blind spots are. Keeping them separate means you can run just the one you
+    need (e.g. only the backup check) without pulling in Graph AND Azure AND
+    Security module dependencies every time.
+
+.PARAMETER OutputFolder
+    Where to write all CSV output (individual reports + the merged master
+    report). Created automatically if it doesn't exist. Defaults to
+    ".\DORA-Evidence-Output" under the current directory.
+
+.PARAMETER SubscriptionId
+    Passed through to every Azure Resource Manager-based script (backup,
+    logging, patching, asset inventory, encryption, network, secure score).
+    If omitted, each script uses whatever subscription your current Azure
+    context defaults to — check with Get-AzContext beforehand if you're not
+    sure which one that is.
+
+.PARAMETER Exclude
+    Friendly names of scripts to SKIP this run. Valid values: ConditionalAccess,
+    BackupRecovery, PrivilegedAccess, LoggingMonitoring, PatchManagement,
+    AssetInventory, Encryption, NetworkSegmentation, SecureScore.
+    Example: -Exclude PatchManagement,SecureScore
+
+.PARAMETER SkipAzurePolicyCheck
+    Passed through to the Conditional Access script to skip its optional
+    Part 2 (Azure Policy DORA initiative lookup), which requires a second,
+    separate Azure sign-in on top of the Graph sign-in.
+
+.EXAMPLE
+    .\Run-DORAEvidenceCollection.ps1
+
+    Runs all nine scripts against your default Graph tenant and default Azure
+    subscription, writes output to .\DORA-Evidence-Output\
+
+.EXAMPLE
+    .\Run-DORAEvidenceCollection.ps1 -SubscriptionId "11111111-2222-3333-4444-555555555555" -Exclude PatchManagement
+
+    Runs everything except the patch management check, against a specific
+    subscription.
+
+.NOTES
+    You will be prompted to sign in more than once — Microsoft Graph and Azure
+    Resource Manager are separate authentication contexts, and PowerShell does
+    not automatically share a session between Connect-MgGraph and
+    Connect-AzAccount. In practice you'll typically see one Graph sign-in
+    prompt (reused across the Graph-based scripts) and one Azure sign-in
+    prompt (reused across the Azure Resource Manager-based scripts), not nine
+    separate prompts — but don't be alarmed if it asks twice.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputFolder = ".\DORA-Evidence-Output",
+    [string]$SubscriptionId,
+    [ValidateSet("ConditionalAccess","BackupRecovery","PrivilegedAccess","LoggingMonitoring",
+                 "PatchManagement","AssetInventory","Encryption","NetworkSegmentation","SecureScore")]
+    [string[]]$Exclude = @(),
+    [switch]$SkipAzurePolicyCheck
+)
+
+$ErrorActionPreference = "Continue"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder | Out-Null
+}
+$OutputFolder = (Resolve-Path $OutputFolder).Path
+
+Write-Host ""
+Write-Host "======================================================================" -ForegroundColor Magenta
+Write-Host " DORA Evidence Collection — running all evidence-gathering scripts" -ForegroundColor Magenta
+Write-Host " Output folder: $OutputFolder" -ForegroundColor Magenta
+Write-Host "======================================================================" -ForegroundColor Magenta
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# Registry of all nine scripts: friendly name, filename, output CSV name,
+# and the extra parameters (if any) each one needs.
+# ---------------------------------------------------------------------------
+$scriptRegistry = @(
+    @{ Name = "ConditionalAccess";   File = "DORA-Evidence-ConditionalAccess.ps1";   Output = "DORA-Evidence-Report.csv";              ExtraParams = @{ SkipAzurePolicyCheck = $SkipAzurePolicyCheck } }
+    @{ Name = "BackupRecovery";      File = "DORA-Evidence-BackupRecovery.ps1";      Output = "DORA-Evidence-BackupRecovery.csv";      ExtraParams = @{} }
+    @{ Name = "PrivilegedAccess";    File = "DORA-Evidence-PrivilegedAccess.ps1";    Output = "DORA-Evidence-PrivilegedAccess.csv";    ExtraParams = @{} }
+    @{ Name = "LoggingMonitoring";   File = "DORA-Evidence-LoggingMonitoring.ps1";   Output = "DORA-Evidence-LoggingMonitoring.csv";   ExtraParams = @{} }
+    @{ Name = "PatchManagement";     File = "DORA-Evidence-PatchManagement.ps1";     Output = "DORA-Evidence-PatchManagement.csv";     ExtraParams = @{} }
+    @{ Name = "AssetInventory";      File = "DORA-Evidence-AssetInventory.ps1";      Output = "DORA-Evidence-AssetInventory.csv";      ExtraParams = @{} }
+    @{ Name = "Encryption";          File = "DORA-Evidence-Encryption.ps1";          Output = "DORA-Evidence-Encryption.csv";          ExtraParams = @{} }
+    @{ Name = "NetworkSegmentation"; File = "DORA-Evidence-NetworkSegmentation.ps1"; Output = "DORA-Evidence-NetworkSegmentation.csv"; ExtraParams = @{} }
+    @{ Name = "SecureScore";         File = "DORA-Evidence-SecureScore.ps1";         Output = "DORA-Evidence-SecureScore.csv";         ExtraParams = @{} }
+)
+
+$runLog = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($entry in $scriptRegistry) {
+
+    if ($Exclude -contains $entry.Name) {
+        Write-Host "[SKIPPED] $($entry.Name) (excluded)" -ForegroundColor DarkGray
+        $runLog.Add([PSCustomObject]@{ Script = $entry.Name; Result = "Skipped (excluded)" })
+        continue
+    }
+
+    $scriptPath = Join-Path $scriptDir $entry.File
+    if (-not (Test-Path $scriptPath)) {
+        Write-Warning "[NOT FOUND] $($entry.File) — expected at $scriptPath. Skipping."
+        $runLog.Add([PSCustomObject]@{ Script = $entry.Name; Result = "Not found" })
+        continue
+    }
+
+    $outputPath = Join-Path $OutputFolder $entry.Output
+
+    Write-Host ""
+    Write-Host "----------------------------------------------------------------------" -ForegroundColor Cyan
+    Write-Host " Running: $($entry.Name)  ($($entry.File))" -ForegroundColor Cyan
+    Write-Host "----------------------------------------------------------------------" -ForegroundColor Cyan
+
+    $params = @{ OutputPath = $outputPath }
+    if ($SubscriptionId -and $entry.Name -ne "ConditionalAccess" -and $entry.Name -ne "PrivilegedAccess") {
+        # Conditional Access and Privileged Access are Graph/tenant-scoped, not subscription-scoped
+        $params["SubscriptionId"] = $SubscriptionId
+    }
+    foreach ($key in $entry.ExtraParams.Keys) {
+        if ($entry.ExtraParams[$key]) { $params[$key] = $entry.ExtraParams[$key] }
+    }
+
+    try {
+        & $scriptPath @params
+        if (Test-Path $outputPath) {
+            $runLog.Add([PSCustomObject]@{ Script = $entry.Name; Result = "Completed" })
+        } else {
+            $runLog.Add([PSCustomObject]@{ Script = $entry.Name; Result = "Ran, but no output file produced — check console output above for errors" })
+        }
+    } catch {
+        Write-Warning "[FAILED] $($entry.Name): $($_.Exception.Message)"
+        $runLog.Add([PSCustomObject]@{ Script = $entry.Name; Result = "Failed: $($_.Exception.Message)" })
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Merge every CSV produced into one master report
+# ---------------------------------------------------------------------------
+Write-Host ""
+Write-Host "======================================================================" -ForegroundColor Magenta
+Write-Host " Merging individual reports into DORA-Evidence-MASTER.csv" -ForegroundColor Magenta
+Write-Host "======================================================================" -ForegroundColor Magenta
+
+$allRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($entry in $scriptRegistry) {
+    $outputPath = Join-Path $OutputFolder $entry.Output
+    if (-not (Test-Path $outputPath)) { continue }
+
+    $rows = Import-Csv -Path $outputPath
+    foreach ($row in $rows) {
+        $row | Add-Member -NotePropertyName "SourceScript" -NotePropertyValue $entry.Name -Force
+        $allRows.Add($row)
+    }
+}
+
+if ($allRows.Count -eq 0) {
+    Write-Warning "No evidence rows were collected. Check the run log below and the console output above for errors."
+} else {
+    $sorted = $allRows | Sort-Object { [int]$_.Article }, Section
+    $masterPath = Join-Path $OutputFolder "DORA-Evidence-MASTER.csv"
+    $sorted | Export-Csv -Path $masterPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host "Master report: $masterPath" -ForegroundColor Green
+    Write-Host "Total evidence rows collected: $($allRows.Count)" -ForegroundColor Green
+
+    # Quick roll-up: how many rows across everything look like they need attention
+    $needsAttention = $allRows | Where-Object {
+        $_.Status -match "Attention needed|NO EVIDENCE|Not confirmed|Attention" -or
+        $_.Status -match "^\d+ / \d+" # e.g. "3 / 40 resource(s)"
+    }
+    Write-Host ""
+    Write-Host "Rows flagged 'Attention needed' or similar across all scripts: $($needsAttention.Count)" -ForegroundColor Yellow
+    Write-Host "(This is a rough text-match count for orientation only — read the actual" -ForegroundColor Yellow
+    Write-Host " Status/Evidence/SuggestedNote columns in the master CSV, don't rely on this number alone.)" -ForegroundColor Yellow
+
+    Write-Host ""
+    Write-Host "Breakdown by DORA Article:" -ForegroundColor Cyan
+    $allRows | Group-Object Article | Sort-Object { [int]$_.Name } | ForEach-Object {
+        Write-Host "  Article $($_.Name): $($_.Count) finding(s)"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Run log
+# ---------------------------------------------------------------------------
+Write-Host ""
+Write-Host "======================================================================" -ForegroundColor Magenta
+Write-Host " Run summary" -ForegroundColor Magenta
+Write-Host "======================================================================" -ForegroundColor Magenta
+$runLog | Format-Table -AutoSize
+
+$runLogPath = Join-Path $OutputFolder "run-log.csv"
+$runLog | Export-Csv -Path $runLogPath -NoTypeInformation -Encoding UTF8
+Write-Host "Run log written to: $runLogPath" -ForegroundColor Green
+
+Write-Host ""
+Write-Host "REMINDER: every row in the master CSV is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "Use the Article/Section columns to find the matching question in the DORA" -ForegroundColor Red
+Write-Host "Self-Assessment workbook, and use the Evidence/SuggestedNote columns to" -ForegroundColor Red
+Write-Host "inform — not replace — the human judgment call on Yes/Partly/No." -ForegroundColor Red
