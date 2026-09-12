@@ -1,0 +1,234 @@
+#Requires -Modules Az.Accounts, Az.Compute, Az.Maintenance
+
+<#
+.SYNOPSIS
+    DORA technical-evidence collector — Patch Management (Article 9).
+
+.DESCRIPTION
+    This is a SMALL, DELIBERATELY LIMITED evidence-gathering script for the DORA
+    Self-Assessment Tool. It does NOT answer Yes/Partly/No for you.
+
+    It connects to Azure Resource Manager (read-only) and inspects how virtual
+    machines in the CURRENT subscription are configured for patching, tagged to
+    Article 9 (Protection and prevention — keeping ICT systems, including software,
+    up to date).
+
+    Same theme as the other scripts in this set: "a patching mechanism is available"
+    and "patches are actually being applied on a schedule" are different things. A
+    VM can exist for years with patch orchestration left on "Manual" or "Image
+    default", meaning nothing is automatically keeping it current unless someone
+    remembers to do it by hand.
+
+    A human still has to judge whether the patching cadence meets your organization's
+    own risk tolerance (e.g. how quickly critical/security patches must be applied),
+    and whether any VMs are deliberately excluded for a documented reason (e.g. a
+    legacy system undergoing decommission) — this script only reports configuration
+    state, not adequacy.
+
+    Permissions required (read-only):
+        Reader on the subscription(s) you want to check
+
+.NOTES
+    Run this against ONE subscription at a time (pass -SubscriptionId, or loop over
+    Get-AzSubscription yourself for multiple).
+
+    This script checks Azure VMs only. It does NOT check Azure VM Scale Sets, AKS
+    node pools, on-premises servers, or non-Azure endpoints managed through
+    Microsoft Defender for Endpoint or a third-party patch tool — those need
+    separate checks against the relevant product's own API.
+
+    Part 4 (live pending-patch counts) is BEST-EFFORT. Retrieving actual pending
+    patch counts requires either a recent Update Manager assessment to have already
+    run, or the Az.ResourceGraph module. If neither is available, this script still
+    reports configuration state (Parts 1-3) without failing.
+
+.OUTPUTS
+    A CSV report at .\DORA-Evidence-PatchManagement.csv and a console summary.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = ".\DORA-Evidence-PatchManagement.csv",
+    [string]$SubscriptionId
+)
+
+# ---------------------------------------------------------------------------
+# 1. Connect (read-only)
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+if ($SubscriptionId) {
+    Connect-AzAccount -Subscription $SubscriptionId | Out-Null
+} else {
+    Connect-AzAccount | Out-Null
+}
+
+$context = Get-AzContext
+Write-Host "Connected to subscription: $($context.Subscription.Name) ($($context.Subscription.Id))" -ForegroundColor Green
+Write-Host ""
+
+$findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Finding {
+    param($Control, $Status, $Evidence, $SuggestedNote, $Section = "1")
+    $findings.Add([PSCustomObject]@{
+        Article       = 9
+        Section       = $Section
+        Topic         = "ICT Risk management"
+        Control       = $Control
+        Status        = $Status
+        Evidence      = $Evidence
+        SuggestedNote = $SuggestedNote
+    })
+}
+
+# ---------------------------------------------------------------------------
+# 2. VM patch orchestration mode — is automatic patching actually configured?
+# ---------------------------------------------------------------------------
+Write-Host "Retrieving virtual machine inventory..." -ForegroundColor Cyan
+$allVMs = Get-AzVM
+
+if (-not $allVMs) {
+    Add-Finding -Control "Virtual machines present" `
+        -Status "No matching resource found" `
+        -Evidence "No virtual machines found in this subscription." `
+        -SuggestedNote "If workloads run elsewhere (another subscription, on-premises, containers/AKS), this script will not see them."
+} else {
+    $modeBreakdown = @{}
+    $manualOrUnmanagedVMs = @()
+
+    foreach ($vm in $allVMs) {
+        $patchMode = $null
+        if ($vm.OSProfile.WindowsConfiguration) {
+            $patchMode = $vm.OSProfile.WindowsConfiguration.PatchSettings.PatchMode
+        } elseif ($vm.OSProfile.LinuxConfiguration) {
+            $patchMode = $vm.OSProfile.LinuxConfiguration.PatchSettings.PatchMode
+        }
+        if (-not $patchMode) { $patchMode = "Unknown/Not set" }
+
+        if (-not $modeBreakdown.ContainsKey($patchMode)) { $modeBreakdown[$patchMode] = 0 }
+        $modeBreakdown[$patchMode]++
+
+        # "Manual" means Azure will not automatically install any updates at all.
+        # "ImageDefault" relies entirely on whatever the base OS image does by default.
+        if ($patchMode -in @("Manual", "ImageDefault", "Unknown/Not set")) {
+            $manualOrUnmanagedVMs += "$($vm.Name) ($patchMode)"
+        }
+    }
+
+    $modeSummary = ($modeBreakdown.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join "; "
+
+    Add-Finding -Control "VM patch orchestration mode breakdown" `
+        -Status "Evidence found — $($allVMs.Count) VM(s) total" `
+        -Evidence $modeSummary `
+        -SuggestedNote "'AutomaticByPlatform' means Azure Update Manager orchestrates patching on a schedule. 'AutomaticByOS' relies on the guest OS's own update service. 'Manual' and 'ImageDefault' mean nothing is automatically applying updates unless a separate process does it."
+
+    Add-Finding -Control "VMs with Manual, ImageDefault, or unset patch mode (likely unmanaged)" `
+        -Status $(if ($manualOrUnmanagedVMs) { "Attention needed — $($manualOrUnmanagedVMs.Count) VM(s)" } else { "None found (good)" }) `
+        -Evidence $(if ($manualOrUnmanagedVMs) { $manualOrUnmanagedVMs -join "; " } else { "All VMs use an automatic patch orchestration mode." }) `
+        -SuggestedNote $(if ($manualOrUnmanagedVMs) {
+            "These VMs will not receive updates automatically. Confirm whether each is covered by an alternative process (e.g. a manual patch cycle, a third-party tool, or is scheduled for decommission) — otherwise this is a real patching gap."
+        } else { "N/A" })
+}
+
+# ---------------------------------------------------------------------------
+# 3. Maintenance configurations — is there an actual patch SCHEDULE defined?
+# ---------------------------------------------------------------------------
+Write-Host "Retrieving maintenance configurations (patch schedules)..." -ForegroundColor Cyan
+$maintenanceConfigs = Get-AzMaintenanceConfiguration -ErrorAction SilentlyContinue
+
+if (-not $maintenanceConfigs) {
+    Add-Finding -Control "Maintenance configuration (patch schedule) defined" `
+        -Status "No matching resource found" `
+        -Evidence "No maintenance configurations found in this subscription." `
+        -SuggestedNote "Without a maintenance configuration, even VMs set to 'AutomaticByPlatform' have no defined schedule for WHEN patches are assessed and installed. This is a common gap: orchestration mode is set correctly, but no schedule was ever attached."
+} else {
+    foreach ($mc in $maintenanceConfigs) {
+        Add-Finding -Control "Maintenance configuration: $($mc.Name)" `
+            -Status "Evidence found" `
+            -Evidence "Scope: $($mc.MaintenanceScope). Recurrence: $($mc.Window.RecurEvery). Duration: $($mc.Window.Duration)." `
+            -SuggestedNote "Confirm the recurrence interval (e.g. weekly, monthly) meets your organization's own patch SLA, particularly for critical/security updates which may need a faster cycle than routine updates."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4. Cross-check: VMs NOT assigned to any maintenance configuration
+# ---------------------------------------------------------------------------
+Write-Host "Cross-checking VM inventory against maintenance schedule assignment..." -ForegroundColor Cyan
+$assignedVMNames = @()
+if ($maintenanceConfigs) {
+    foreach ($mc in $maintenanceConfigs) {
+        try {
+            $assignments = Get-AzConfigurationAssignment -ResourceGroupName $mc.ResourceGroupName -ProviderName "Microsoft.Maintenance" -ResourceType "maintenanceConfigurations" -ResourceName $mc.Name -ErrorAction SilentlyContinue
+            if ($assignments) { $assignedVMNames += ($assignments | ForEach-Object { $_.ResourceId -split '/' | Select-Object -Last 1 }) }
+        } catch { }
+    }
+}
+
+if ($allVMs) {
+    $unassignedVMs = $allVMs | Where-Object { $assignedVMNames -notcontains $_.Name }
+
+    Add-Finding -Control "VMs with NO maintenance configuration assigned" `
+        -Status $(if ($unassignedVMs) { "Attention needed — $($unassignedVMs.Count) VM(s)" } else { "All VMs assigned to a schedule" }) `
+        -Evidence $(if ($unassignedVMs) { ($unassignedVMs | ForEach-Object { $_.Name }) -join "; " } else { "All $($allVMs.Count) VM(s) are assigned to at least one maintenance configuration." }) `
+        -SuggestedNote $(if ($unassignedVMs) {
+            "Configuration-assignment lookups can be incomplete depending on how assignments were made (portal vs. Azure Policy vs. ARM template) — treat a non-zero count here as a strong signal to verify manually in the portal, not a definitive gap list."
+        } else { "N/A" })
+}
+
+# ---------------------------------------------------------------------------
+# 5. BEST-EFFORT: live pending-patch counts via Azure Resource Graph
+# ---------------------------------------------------------------------------
+Write-Host "Attempting to retrieve live pending-patch counts (best-effort)..." -ForegroundColor Cyan
+if (Get-Module -ListAvailable -Name Az.ResourceGraph) {
+    try {
+        $query = @"
+patchassessmentresources
+| project vmName = tostring(split(properties.assessedVmId, '/')[-1]),
+          criticalAndSecurityPatches = properties.availablePatchCountByClassification.critical + properties.availablePatchCountByClassification.security,
+          lastAssessed = properties.lastModifiedDateTime
+"@
+        $patchData = Search-AzGraph -Query $query -ErrorAction Stop
+
+        if ($patchData) {
+            $vmsWithPending = $patchData | Where-Object { $_.criticalAndSecurityPatches -gt 0 }
+            Add-Finding -Control "VMs with pending critical/security patches (live assessment data)" `
+                -Status $(if ($vmsWithPending) { "Attention needed — $($vmsWithPending.Count) VM(s)" } else { "None pending at last assessment" }) `
+                -Evidence $(if ($vmsWithPending) { ($vmsWithPending | ForEach-Object { "$($_.vmName): $($_.criticalAndSecurityPatches) pending (last assessed $($_.lastAssessed))" }) -join "; " } else { "No VMs show pending critical or security patches as of their last assessment." }) `
+                -SuggestedNote "This reflects the last time each VM was ASSESSED, not necessarily today. A VM with a stale or missing assessment can show 'no pending patches' simply because it hasn't been checked recently — cross-reference the 'lastAssessed' date."
+        } else {
+            Add-Finding -Control "VMs with pending critical/security patches (live assessment data)" `
+                -Status "No assessment data found" `
+                -Evidence "The Resource Graph query returned no patch assessment records. This usually means Update Manager has not yet run a periodic assessment against these VMs." `
+                -SuggestedNote "Trigger a manual assessment in Azure Update Manager, or wait for the automatic periodic assessment, then re-run this script."
+        }
+    } catch {
+        Add-Finding -Control "VMs with pending critical/security patches (live assessment data)" `
+            -Status "Query failed" `
+            -Evidence "Could not query patch assessment data: $($_.Exception.Message)" `
+            -SuggestedNote "Check pending-patch counts directly in Azure Update Manager in the portal instead."
+    }
+} else {
+    Add-Finding -Control "VMs with pending critical/security patches (live assessment data)" `
+        -Status "Skipped — Az.ResourceGraph not installed" `
+        -Evidence "Install-Module Az.ResourceGraph to enable this check." `
+        -SuggestedNote "Configuration state (Parts 1-3 above) is still valid evidence without this. Check pending-patch counts directly in Azure Update Manager if needed now."
+}
+
+# ---------------------------------------------------------------------------
+# 6. Output
+# ---------------------------------------------------------------------------
+$findings | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== DORA Evidence Report (Article 9 — Patch Management) ===" -ForegroundColor Yellow
+$findings | Format-Table Control, Status -AutoSize -Wrap
+Write-Host ""
+Write-Host "Full report with evidence and notes written to: $OutputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "REMINDER: This report is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "Patch orchestration mode being set correctly does not guarantee patches are" -ForegroundColor Red
+Write-Host "actually being applied — check the maintenance configuration and pending-patch" -ForegroundColor Red
+Write-Host "findings above too. A human still needs to judge whether the cadence meets" -ForegroundColor Red
+Write-Host "your organization's own risk tolerance for critical/security updates." -ForegroundColor Red
+
+Disconnect-AzAccount | Out-Null
