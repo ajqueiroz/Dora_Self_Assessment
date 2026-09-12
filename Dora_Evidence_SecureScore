@@ -1,0 +1,164 @@
+#Requires -Modules Az.Accounts, Az.Security
+
+<#
+.SYNOPSIS
+    DORA technical-evidence collector — Secure Configuration Baseline (Article 9).
+
+.DESCRIPTION
+    This is a SMALL, DELIBERATELY LIMITED evidence-gathering script for the DORA
+    Self-Assessment Tool. It does NOT answer Yes/Partly/No for you.
+
+    It connects to Microsoft Defender for Cloud (read-only) and pulls your
+    subscription's Secure Score and the highest-impact unresolved recommendations,
+    tagged to Article 9 (Protection and prevention — sound, comprehensive ICT
+    security policies and controls).
+
+    UNLIKE the other scripts in this set, this one is a SUMMARY across many
+    controls rather than a single deep check. It exists to answer a different
+    question: "of everything Microsoft's own baseline checks for, what's still
+    unresolved, and how much would fixing it actually move the needle?" Treat this
+    as a cross-check against the other seven scripts, not a replacement for them —
+    Secure Score is Microsoft's own weighting of what matters, which will not
+    always line up with what DORA specifically requires.
+
+    A human still has to decide which recommendations are relevant to in-scope
+    critical/important functions, and which are false positives for this
+    environment (e.g. a recommendation for a resource type you don't actually use).
+
+    Permissions required (read-only):
+        Reader / Security Reader on the subscription(s) you want to check
+
+.NOTES
+    Run this against ONE subscription at a time (pass -SubscriptionId, or loop over
+    Get-AzSubscription yourself for multiple).
+
+    Secure Score and recommendation coverage depend heavily on which Microsoft
+    Defender for Cloud plans are enabled (Free vs paid tiers per resource type — see
+    the DORA-Evidence-LoggingMonitoring.ps1 script for that check specifically). A
+    low score is not directly comparable across subscriptions with different plans
+    enabled.
+
+.OUTPUTS
+    A CSV report at .\DORA-Evidence-SecureScore.csv and a console summary.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = ".\DORA-Evidence-SecureScore.csv",
+    [string]$SubscriptionId,
+    [int]$TopRecommendations = 15
+)
+
+# ---------------------------------------------------------------------------
+# 1. Connect (read-only)
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+if ($SubscriptionId) {
+    Connect-AzAccount -Subscription $SubscriptionId | Out-Null
+} else {
+    Connect-AzAccount | Out-Null
+}
+
+$context = Get-AzContext
+Write-Host "Connected to subscription: $($context.Subscription.Name) ($($context.Subscription.Id))" -ForegroundColor Green
+Write-Host ""
+
+$findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Finding {
+    param($Control, $Status, $Evidence, $SuggestedNote, $Section = "1")
+    $findings.Add([PSCustomObject]@{
+        Article       = 9
+        Section       = $Section
+        Topic         = "ICT Risk management"
+        Control       = $Control
+        Status        = $Status
+        Evidence      = $Evidence
+        SuggestedNote = $SuggestedNote
+    })
+}
+
+# ---------------------------------------------------------------------------
+# 2. Overall Secure Score
+# ---------------------------------------------------------------------------
+Write-Host "Retrieving overall Secure Score..." -ForegroundColor Cyan
+try {
+    $secureScores = Get-AzSecurityScore -ErrorAction Stop
+
+    if ($secureScores) {
+        foreach ($score in $secureScores) {
+            $pct = if ($score.Max -gt 0) { [math]::Round(($score.Current / $score.Max) * 100, 1) } else { 0 }
+            Add-Finding -Control "Microsoft Defender for Cloud Secure Score" `
+                -Status "$pct% ($($score.Current) / $($score.Max) points)" `
+                -Evidence "Secure Score name: $($score.Name)." `
+                -SuggestedNote "Secure Score is Microsoft's own weighting across many controls, not a DORA-specific measure. A low score here is a prompt to look at the individual recommendations below, not a compliance verdict by itself. Score is also only as complete as the Defender for Cloud plans you have enabled — see the logging/monitoring script's Free-tier finding for context."
+        }
+    } else {
+        Add-Finding -Control "Microsoft Defender for Cloud Secure Score" `
+            -Status "No score data returned" `
+            -Evidence "Get-AzSecurityScore returned no results." `
+            -SuggestedNote "This can happen if Defender for Cloud has never been opened for this subscription, or if the account running this script lacks Security Reader access. Check the Defender for Cloud Overview page directly."
+    }
+} catch {
+    Add-Finding -Control "Microsoft Defender for Cloud Secure Score" `
+        -Status "Could not retrieve" `
+        -Evidence "Get-AzSecurityScore failed: $($_.Exception.Message)" `
+        -SuggestedNote "Confirm Microsoft Defender for Cloud has been enabled/visited at least once for this subscription, and that the signed-in account has Security Reader (or higher) access."
+}
+
+# ---------------------------------------------------------------------------
+# 3. Highest-impact unresolved recommendations
+# ---------------------------------------------------------------------------
+Write-Host "Retrieving unresolved security recommendations..." -ForegroundColor Cyan
+try {
+    $assessments = Get-AzSecurityAssessment -ErrorAction Stop
+
+    $unhealthy = $assessments | Where-Object { $_.Status.Code -eq "Unhealthy" }
+
+    if ($unhealthy) {
+        # Group by display name since the same recommendation often applies to many resources
+        $grouped = $unhealthy | Group-Object -Property DisplayName | Sort-Object Count -Descending | Select-Object -First $TopRecommendations
+
+        foreach ($group in $grouped) {
+            Add-Finding -Control "Unresolved recommendation: $($group.Name)" `
+                -Section "1" `
+                -Status "Attention needed — affects $($group.Count) resource(s)" `
+                -Evidence "Severity: $($group.Group[0].Metadata.Severity). Category: $($group.Group[0].Metadata.Categories -join ', ')." `
+                -SuggestedNote "Grouped by recommendation, not by individual resource, to keep this readable — open Defender for Cloud's Recommendations page for the full per-resource list. Prioritise 'High' severity items affecting resources that support a critical or important function first."
+        }
+
+        Add-Finding -Control "Total unresolved (unhealthy) recommendations" `
+            -Status "$($unhealthy.Count) recommendation instance(s) across all resources" `
+            -Evidence "Showing the top $TopRecommendations most common recommendations above, grouped by type." `
+            -SuggestedNote "A high total count is less important than whether any 'High' severity items affect resources supporting critical or important functions specifically."
+    } else {
+        Add-Finding -Control "Unresolved (unhealthy) security recommendations" `
+            -Status "None found" `
+            -Evidence "No unhealthy assessments returned." `
+            -SuggestedNote "This is a strong result if accurate, but confirm it isn't simply because few Defender for Cloud plans are enabled (which reduces how much is being assessed at all) rather than because everything is genuinely healthy."
+    }
+} catch {
+    Add-Finding -Control "Unresolved security recommendations" `
+        -Status "Could not retrieve" `
+        -Evidence "Get-AzSecurityAssessment failed: $($_.Exception.Message)" `
+        -SuggestedNote "Check the Defender for Cloud Recommendations page directly in the portal instead."
+}
+
+# ---------------------------------------------------------------------------
+# 4. Output
+# ---------------------------------------------------------------------------
+$findings | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== DORA Evidence Report (Article 9 — Secure Configuration Baseline) ===" -ForegroundColor Yellow
+$findings | Format-Table Control, Status -AutoSize -Wrap
+Write-Host ""
+Write-Host "Full report with evidence and notes written to: $OutputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "REMINDER: This report is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "Secure Score is MICROSOFT'S OWN weighting of what matters across many" -ForegroundColor Red
+Write-Host "controls — it will not always line up with what DORA specifically asks." -ForegroundColor Red
+Write-Host "Use it as a cross-check against the other evidence scripts in this set," -ForegroundColor Red
+Write-Host "not as a standalone compliance measure." -ForegroundColor Red
+
+Disconnect-AzAccount | Out-Null
