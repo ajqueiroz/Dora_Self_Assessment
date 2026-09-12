@@ -1,0 +1,195 @@
+#Requires -Modules Az.Accounts, Az.Storage, Az.Sql, Az.Compute, Az.KeyVault, Az.Resources
+
+<#
+.SYNOPSIS
+    DORA technical-evidence collector — Encryption at Rest & in Transit (Article 9).
+
+.DESCRIPTION
+    This is a SMALL, DELIBERATELY LIMITED evidence-gathering script for the DORA
+    Self-Assessment Tool. It does NOT answer Yes/Partly/No for you.
+
+    Article 9(4)(c) specifically requires "technologies and processes for encryption
+    of data at rest and data in transit, based on the results of an approved data
+    classification and ICT risk assessment process." This script checks whether the
+    technical controls are actually turned ON — not whether your data classification
+    process is any good, which is a separate, non-technical question this script
+    cannot answer.
+
+    Same theme as the rest of this script set: Azure enables SOME encryption by
+    default (e.g. storage encryption-at-rest), so "is it encrypted" is often less
+    interesting than "is it encrypted with a key you control" and "is the in-transit
+    side (minimum TLS version, HTTPS enforcement) actually locked down, or just
+    technically available and left permissive."
+
+    A human still has to confirm the encryption approach matches what your data
+    classification exercise actually requires (e.g. does a specific dataset need
+    customer-managed keys, or is platform-managed encryption sufficient) — this
+    script only reports configuration state, not adequacy.
+
+    Permissions required (read-only):
+        Reader on the subscription(s) you want to check
+
+.NOTES
+    Run this against ONE subscription at a time (pass -SubscriptionId, or loop over
+    Get-AzSubscription yourself for multiple).
+
+    This checks Azure Storage, Azure SQL, Managed Disks, and Key Vault presence. It
+    does NOT check encryption within application code, third-party SaaS data stores,
+    on-premises systems, or Microsoft 365 data (Exchange/SharePoint/OneDrive have
+    their own, separate encryption configuration and reporting surface).
+
+.OUTPUTS
+    A CSV report at .\DORA-Evidence-Encryption.csv and a console summary.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = ".\DORA-Evidence-Encryption.csv",
+    [string]$SubscriptionId
+)
+
+# ---------------------------------------------------------------------------
+# 1. Connect (read-only)
+# ---------------------------------------------------------------------------
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+if ($SubscriptionId) {
+    Connect-AzAccount -Subscription $SubscriptionId | Out-Null
+} else {
+    Connect-AzAccount | Out-Null
+}
+
+$context = Get-AzContext
+Write-Host "Connected to subscription: $($context.Subscription.Name) ($($context.Subscription.Id))" -ForegroundColor Green
+Write-Host ""
+
+$findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Finding {
+    param($Control, $Status, $Evidence, $SuggestedNote, $Section = "4")
+    $findings.Add([PSCustomObject]@{
+        Article       = 9
+        Section       = $Section
+        Topic         = "ICT Risk management"
+        Control       = $Control
+        Status        = $Status
+        Evidence      = $Evidence
+        SuggestedNote = $SuggestedNote
+    })
+}
+
+# ---------------------------------------------------------------------------
+# 2. Storage accounts — encryption at rest (key management) + in-transit controls
+# ---------------------------------------------------------------------------
+Write-Host "Checking Storage account encryption settings..." -ForegroundColor Cyan
+$storageAccounts = Get-AzStorageAccount -ErrorAction SilentlyContinue
+
+if (-not $storageAccounts) {
+    Add-Finding -Control "Storage accounts present" `
+        -Status "No matching resource found" `
+        -Evidence "No Storage accounts found in this subscription." `
+        -SuggestedNote "N/A if this subscription does not host storage accounts supporting in-scope functions."
+} else {
+    $platformManagedCount = ($storageAccounts | Where-Object { $_.Encryption.KeySource -eq "Microsoft.Storage" }).Count
+    $customerManagedCount = ($storageAccounts | Where-Object { $_.Encryption.KeySource -eq "Microsoft.Keyvault" }).Count
+
+    Add-Finding -Control "Storage account encryption-at-rest key management" `
+        -Status "Evidence found — $($storageAccounts.Count) account(s) total" `
+        -Evidence "$platformManagedCount account(s) using Microsoft-managed keys; $customerManagedCount account(s) using customer-managed keys (Key Vault)." `
+        -SuggestedNote "Encryption at rest is enabled by default in Azure Storage, so this is not a Yes/No gap by itself. Platform-managed keys are adequate for most data; customer-managed keys matter specifically where your data classification requires you to control key rotation and revocation independently of Microsoft."
+
+    $insecureTls = $storageAccounts | Where-Object { $_.MinimumTlsVersion -and $_.MinimumTlsVersion -ne "TLS1_2" -and $_.MinimumTlsVersion -ne "TLS1_3" }
+    Add-Finding -Control "Storage accounts allowing TLS below 1.2 (in-transit encryption)" `
+        -Status $(if ($insecureTls) { "Attention needed — $($insecureTls.Count) account(s)" } else { "All accounts enforce TLS 1.2+" }) `
+        -Evidence $(if ($insecureTls) { ($insecureTls | ForEach-Object { "$($_.StorageAccountName) (minimum: $($_.MinimumTlsVersion))" }) -join "; " } else { "N/A" }) `
+        -SuggestedNote $(if ($insecureTls) { "TLS versions below 1.2 have known weaknesses and are deprecated by most clients already — this is a straightforward fix (Set-AzStorageAccount -MinimumTlsVersion TLS1_2) unless a specific legacy client genuinely requires it, which should be documented as an exception." } else { "N/A" })
+
+    $noHttpsOnly = $storageAccounts | Where-Object { -not $_.EnableHttpsTrafficOnly }
+    Add-Finding -Control "Storage accounts NOT enforcing HTTPS-only traffic" `
+        -Status $(if ($noHttpsOnly) { "Attention needed — $($noHttpsOnly.Count) account(s)" } else { "All accounts enforce HTTPS-only" }) `
+        -Evidence $(if ($noHttpsOnly) { ($noHttpsOnly | ForEach-Object { $_.StorageAccountName }) -join "; " } else { "N/A" }) `
+        -SuggestedNote $(if ($noHttpsOnly) { "Plain HTTP is permitted for these accounts, meaning data in transit can be sent unencrypted if a client happens to use an http:// endpoint. Confirm nothing actually relies on this before enforcing HTTPS-only." } else { "N/A" })
+
+    $publicBlobAccess = $storageAccounts | Where-Object { $_.AllowBlobPublicAccess -eq $true }
+    Add-Finding -Control "Storage accounts allowing public blob access" `
+        -Status $(if ($publicBlobAccess) { "Attention needed — $($publicBlobAccess.Count) account(s)" } else { "Public blob access disabled everywhere" }) `
+        -Evidence $(if ($publicBlobAccess) { ($publicBlobAccess | ForEach-Object { $_.StorageAccountName }) -join "; " } else { "N/A" }) `
+        -SuggestedNote $(if ($publicBlobAccess) { "This is a related but distinct control from encryption itself — data can be fully encrypted at rest and in transit and still be publicly readable if a container's access level is set to allow anonymous access. Confirm whether any of these accounts are intentionally hosting public content (e.g. a public website's static assets) versus an oversight." } else { "N/A" })
+}
+
+# ---------------------------------------------------------------------------
+# 3. Azure SQL — Transparent Data Encryption (TDE) status
+# ---------------------------------------------------------------------------
+Write-Host "Checking Azure SQL Transparent Data Encryption (TDE) status..." -ForegroundColor Cyan
+$sqlServers = Get-AzSqlServer -ErrorAction SilentlyContinue
+
+if (-not $sqlServers) {
+    Add-Finding -Control "Azure SQL TDE status" `
+        -Status "No matching resource found" `
+        -Evidence "No Azure SQL servers found in this subscription." `
+        -SuggestedNote "N/A if this subscription does not host SQL databases supporting in-scope functions."
+} else {
+    foreach ($server in $sqlServers) {
+        $databases = Get-AzSqlDatabase -ServerName $server.ServerName -ResourceGroupName $server.ResourceGroupName -ErrorAction SilentlyContinue |
+            Where-Object { $_.DatabaseName -ne "master" }
+
+        foreach ($db in $databases) {
+            $tde = Get-AzSqlDatabaseTransparentDataEncryption -ServerName $server.ServerName -ResourceGroupName $server.ResourceGroupName -DatabaseName $db.DatabaseName -ErrorAction SilentlyContinue
+
+            Add-Finding -Control "TDE status: $($server.ServerName)/$($db.DatabaseName)" `
+                -Status $(if ($tde.State -eq "Enabled") { "Evidence found — enabled" } else { "Attention needed — $($tde.State)" }) `
+                -Evidence "Transparent Data Encryption state: $($tde.State)." `
+                -SuggestedNote $(if ($tde.State -eq "Enabled") { "TDE is on by default for new Azure SQL databases, so this is expected. Confirm whether this database's data classification requires a customer-managed key (Bring Your Own Key) rather than the service-managed key." } else { "TDE being off on an Azure SQL database is unusual and worth investigating immediately — this typically only happens if it was explicitly disabled." })
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4. Managed disk encryption
+# ---------------------------------------------------------------------------
+Write-Host "Checking managed disk encryption settings..." -ForegroundColor Cyan
+$disks = Get-AzDisk -ErrorAction SilentlyContinue
+
+if (-not $disks) {
+    Add-Finding -Control "Managed disk encryption" `
+        -Status "No matching resource found" `
+        -Evidence "No managed disks found in this subscription." `
+        -SuggestedNote "N/A"
+} else {
+    $encryptionBreakdown = $disks | Group-Object { $_.Encryption.Type } | ForEach-Object { "$($_.Name -replace '^$','(none/unset)'): $($_.Count)" }
+
+    Add-Finding -Control "Managed disk encryption type breakdown" `
+        -Status "Evidence found — $($disks.Count) disk(s) total" `
+        -Evidence ($encryptionBreakdown -join "; ") `
+        -SuggestedNote "'EncryptionAtRestWithPlatformKey' is Azure's default and is always on for managed disks — this is expected, not a gap. 'EncryptionAtRestWithCustomerKey' means Azure Disk Encryption or a customer-managed key is in use, relevant where your data classification specifically requires it."
+}
+
+# ---------------------------------------------------------------------------
+# 5. Key Vault presence — governance signal for centralised key/secret management
+# ---------------------------------------------------------------------------
+Write-Host "Checking Key Vault presence..." -ForegroundColor Cyan
+$keyVaults = Get-AzKeyVault -ErrorAction SilentlyContinue
+
+Add-Finding -Control "Key Vault(s) present for centralised key/secret management" `
+    -Status $(if ($keyVaults) { "Evidence found — $($keyVaults.Count) vault(s)" } else { "No Key Vaults found" }) `
+    -Evidence $(if ($keyVaults) { ($keyVaults | ForEach-Object { $_.VaultName }) -join "; " } else { "No Key Vault resources found in this subscription." }) `
+    -SuggestedNote $(if ($keyVaults) { "A Key Vault existing does not confirm secrets/certificates are actually stored there rather than hardcoded elsewhere (application config, environment variables, source code) — that requires reviewing application configuration directly, which this script cannot see." } else { "Absence of any Key Vault is a strong signal that customer-managed keys and centralised secret management are not in use anywhere in this subscription — worth confirming where secrets and encryption keys are actually managed." })
+
+# ---------------------------------------------------------------------------
+# 6. Output
+# ---------------------------------------------------------------------------
+$findings | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== DORA Evidence Report (Article 9 — Encryption at Rest & in Transit) ===" -ForegroundColor Yellow
+$findings | Format-Table Control, Status -AutoSize -Wrap
+Write-Host ""
+Write-Host "Full report with evidence and notes written to: $OutputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "REMINDER: This report is evidence, not a compliance answer." -ForegroundColor Red
+Write-Host "Most of Azure's storage/disk encryption-at-rest is ON by default — the" -ForegroundColor Red
+Write-Host "findings that matter most here are the in-transit (TLS/HTTPS) and public" -ForegroundColor Red
+Write-Host "access checks, since those are permissive by default and easy to overlook." -ForegroundColor Red
+Write-Host "A human still needs to confirm the encryption approach matches what your" -ForegroundColor Red
+Write-Host "own data classification exercise actually requires." -ForegroundColor Red
+
+Disconnect-AzAccount | Out-Null
